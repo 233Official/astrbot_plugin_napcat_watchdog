@@ -1,0 +1,6 @@
+name: astrbot_plugin_napcat_watchdog
+display_name: NapCat QQ 存活监控
+desc: 面向 NapCat QQ 实例存活状态检查与异常通知的 AstrBot 插件，目前处于需求设计阶段，仅提供最小骨架。
+version: v0.1.0
+author: 233Official
+repo: https://github.com/233Official/astrbot_plugin_napcat_watchdog
