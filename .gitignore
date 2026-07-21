@@ -7,5 +7,11 @@ htmlcov/
 .venv/
 venv/
 .idea/
-.vscode/
 .DS_Store
+
+# 包构建产物
+dist/
+tmp/
+.opencode/
+
+# 不整体忽略 .vscode/ — 允许跟踪 .vscode/launch.json

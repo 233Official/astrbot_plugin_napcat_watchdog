@@ -108,6 +108,27 @@ ruff format --check .
 
 ---
 
+## 打包与发布
+
+插件支持标准打包流程，生成适用于 AstrBot WebUI 上传安装的 ZIP 包。
+
+```bash
+# 正式包 (dist/astrbot_plugin_napcat_watchdog-v0.1.0.zip)
+python scripts/package_plugin.py
+
+# 测试包 (dist/astrbot_plugin_napcat_watchdog-v0.1.0.dev<timestamp>.zip)
+python scripts/package_plugin.py --dev-version
+
+# 旧版扁平包 (无顶层插件目录)
+python scripts/package_plugin.py --dev-version --flat
+```
+
+正式包满足 WebUI 上传要求：ZIP 内包含 `astrbot_plugin_napcat_watchdog/` 顶层目录。打包脚本会自动校验 `metadata.yaml` 与 `pyproject.toml` 的版本一致性，仅在包内修改版本号（不修改工作区源文件）。
+
+> 注：当前为开发阶段，尚未发布正式 Release。
+
+---
+
 ## 许可证
 
 本项目使用 MIT License，详见 [LICENSE](LICENSE)。

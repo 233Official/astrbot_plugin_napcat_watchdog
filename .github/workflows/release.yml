@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 Git tag，例如 v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyyaml pytest pytest-asyncio ruff
+
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import tomllib
+          from pathlib import Path
+
+          import yaml
+
+          tag = os.environ["RELEASE_TAG"]
+          metadata = yaml.safe_load(Path("metadata.yaml").read_text(encoding="utf-8"))
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+          metadata_version = metadata.get("version")
+          project_version = project["project"]["version"]
+          expected_project_version = tag.removeprefix("v")
+
+          errors = []
+          if metadata_version != tag:
+              errors.append(f"metadata.yaml version {metadata_version!r} != tag {tag!r}")
+          if project_version != expected_project_version:
+              errors.append(
+                  f"pyproject.toml version {project_version!r} != {expected_project_version!r}"
+              )
+
+          if errors:
+              raise SystemExit("\n".join(errors))
+          PY
+
+      - name: Lint with Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Compile all Python sources
+        run: python -m compileall . -q
+
+      - name: Build plugin archive
+        run: python scripts/package_plugin.py
+
+      - name: Validate plugin archive
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import zipfile
+          from pathlib import Path
+
+          dist_dir = Path("dist")
+          zips = list(dist_dir.glob("*.zip"))
+          assert len(zips) == 1, f"Expected exactly one zip, got {len(zips)}"
+          zip_path = zips[0]
+          print(f"Validating: {zip_path}")
+
+          with zipfile.ZipFile(zip_path) as zf:
+              names = zf.namelist()
+
+              # Must have a top-level directory
+              top_dirs = [n for n in names if n.endswith("/")]
+              assert len(top_dirs) == 1, f"Expected 1 top dir, got {top_dirs}"
+              prefix = top_dirs[0]
+
+              # Required files
+              for req in ("main.py", "metadata.yaml", "_conf_schema.json",
+                          "requirements.txt", "pyproject.toml", "README.md"):
+                  assert f"{prefix}{req}" in names, f"Missing {prefix}{req}"
+
+              # core/ and docs/ must be present
+              assert any(n.startswith(f"{prefix}core/") for n in names), "Missing core/ files"
+              assert any(n.startswith(f"{prefix}docs/") for n in names), "Missing docs/ files"
+
+              # Excluded content
+              forbidden = (".git", ".github", ".vscode", "tests", "tmp",
+                           "dist", "__pycache__", ".pytest_cache", ".ruff_cache")
+              for n in names:
+                  for f in forbidden:
+                      assert f not in n, f"Forbidden path in archive: {n}"
+
+          print("Archive validation passed.")
+          PY
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-release-${{ inputs.tag || github.ref_name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*.zip
+          fail_on_unmatched_files: true
+          make_latest: true
