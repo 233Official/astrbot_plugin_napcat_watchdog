@@ -16,7 +16,7 @@
 
 - 通过 AstrBot 的 `Star` 子类自动发现机制加载插件。
 - 当前骨架暂时提供只读命令 `/napcat_watchdog_status`，仅用于确认插件已经加载；正式实现将迁移为 `/napcat_watchdog status` 子命令格式。
-- 提供空配置 schema，避免在 PRD 确认前固化实例或通知目标结构。
+- 当前骨架仍使用空配置 schema，正式监控配置尚未实现。
 
 ---
 
@@ -24,13 +24,26 @@
 
 以下能力仅为后续设计目标，不代表当前版本已经实现：
 
-- 由 1–20 个 NapCat OneBot 11 WebSocket Client 主动连接插件提供的 WS 服务，公网 WSS/TLS 由 Caddy 终止。
-- 仅消费 lifecycle 与 heartbeat，基于心跳、防抖和重连窗口区分 QQ 离线、连接丢失与从未连接。
-- 使用实例独立 Token、`X-Self-ID` 和预配置白名单完成鉴权与身份校验。
-- 通过唯一 AstrBot 通知账号向多个目标群发送一次异常和一次恢复通知，并持久化状态与待补发摘要。
-- 通过 WebUI 管理配置，并提供仅管理员可用的 `/napcat_watchdog status` 只读状态命令。
+- 插件自建 `aiohttp` WebSocket 服务端，由 1–20 个 NapCat OneBot 11 WebSocket Client 通过 Caddy WSS/TLS 主动连接。
+- 所有 NapCat 共用自动生成或手动配置的全局 Bearer Token，并通过 `X-Self-ID` 自动登记，无需实例白名单。
+- 仅消费 lifecycle 与 heartbeat；WS 断开、心跳缺失或持续 `online=false` 达到默认 90 秒后，统一通知“NapCat 掉线”。
+- AstrBot 管理员在 QQ 群内订阅全部当前和未来 NapCat 状态；掉线通知提及该群订阅负责人，上线通知不提及。
+- 使用轻量 JSON 原子持久化状态、群订阅和待补发摘要，避免重启重复通知。
+- WebUI 仅管理监听地址、公网 WSS 地址、全局 Token 和掉线超时等最小配置。
 
 完整范围、兼容基线和验收标准见 [产品需求文档](docs/PRD.md)。
+
+---
+
+## 最终命令
+
+正式实现计划提供以下仅管理员可用的命令：
+
+- `/napcat_watchdog subscribe`：在当前 QQ 群订阅全部 NapCat 状态。
+- `/napcat_watchdog unsubscribe`：取消当前 QQ 群订阅。
+- `/napcat_watchdog status`：查看连接、状态和订阅摘要。
+
+其中 `subscribe` 和 `unsubscribe` 仅可在群聊中执行。上述命令尚未实现，当前骨架验证仍使用 `/napcat_watchdog_status`。
 
 ---
 
