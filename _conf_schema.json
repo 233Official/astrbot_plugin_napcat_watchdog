@@ -1,1 +1,32 @@
-{}
+{
+  "listen_host": {
+    "type": "string",
+    "default": "0.0.0.0",
+    "description": "容器内 WebSocket 监听地址。默认 0.0.0.0 以允许 Caddy 通过 Docker 网络访问。"
+  },
+  "listen_port": {
+    "type": "int",
+    "default": 19090,
+    "description": "本地监听端口，建议范围 1024–65535。默认 19090。"
+  },
+  "ws_path": {
+    "type": "string",
+    "default": "/napcat-watchdog/ws",
+    "description": "WebSocket 路径，需与 Caddy 路由和 NapCat 连接地址一致。"
+  },
+  "public_ws_url": {
+    "type": "string",
+    "default": "",
+    "description": "NapCat 使用的公网 WSS 完整地址，例如 wss://watchdog.example.com/napcat-watchdog/ws。空值表示尚未部署公网入口。"
+  },
+  "access_token": {
+    "type": "string",
+    "default": "",
+    "description": "全局 Bearer Token，所有 NapCat 共用。为空时插件首次启动自动生成。修改后现有连接将被关闭。"
+  },
+  "offline_timeout_seconds": {
+    "type": "int",
+    "default": 90,
+    "description": "掉线防抖时间（秒）。达到该时长未收到有效心跳或连接断开后确认 NapCat 掉线。当前仅配置占位，状态机尚未实现。"
+  }
+}

@@ -29,8 +29,8 @@ MVP 目标如下：
 ### 2.1 服务启动
 
 - 插件启动 `aiohttp` WebSocket 服务端。
-- 服务默认监听 `127.0.0.1:19090`，默认路径为 `/napcat-watchdog/ws`。
-- 公网入口由 Caddy 提供 WSS/TLS，并反向代理到插件本地监听地址。
+- 服务默认在 AstrBot 容器内监听 `0.0.0.0:19090`，默认路径为 `/napcat-watchdog/ws`。
+- 公网入口由同一 Docker 网络中的 Caddy 提供 WSS/TLS，并通过容器服务名反向代理到插件监听地址；宿主机不得直接向公网映射 `19090`。
 - 管理员在 WebUI 中配置对 NapCat 可见的 `public_ws_url`。
 
 ### 2.2 Token 初始化与轮换
@@ -111,17 +111,17 @@ MVP 目标如下：
 
 WebUI 仅提供以下配置：
 
-- `listen_host`：本地监听地址，默认 `127.0.0.1`。
+- `listen_host`：容器内监听地址，默认 `0.0.0.0`，用于允许同一 Docker 网络中的 Caddy 访问。
 - `listen_port`：本地监听端口，默认 `19090`。
 - `ws_path`：WebSocket 路径，默认 `/napcat-watchdog/ws`。
 - `public_ws_url`：NapCat 使用的公网 WSS 完整地址。
-- `access_token`：全局 Bearer Token，使用 password 字段；为空时由插件首次启动自动生成。
+- `access_token`：全局 Bearer Token，使用标准字符串配置字段；为空时由插件首次启动自动生成。
 - `offline_timeout_seconds`：掉线防抖时间，默认 `90` 秒。
 
 配置要求如下：
 
 - `public_ws_url` 应使用 `wss://`，并与 Caddy 公网入口及 `ws_path` 一致。
-- `access_token` 在 UI 中必须掩码展示，不得在非编辑上下文中回显原值。
+- `access_token` 仅允许 AstrBot 管理员在插件配置编辑页面查看和修改；MVP 不承诺标准配置组件具备密码掩码能力。
 - 修改监听配置后，插件应按 AstrBot 插件生命周期安全重建监听服务。
 - 修改 `access_token` 后，必须关闭现有连接并要求全部客户端重新鉴权。
 - MVP 规模为 1–20 个同时受监控的 QQ。
@@ -335,7 +335,7 @@ WebUI 仅提供以下配置：
 ## 12. 安全与可观测性
 
 - 使用密码学安全随机源生成全局 Token，随机数据不少于 32 字节。
-- WebUI 使用 password 字段并掩码展示 Token。
+- Token 仅在 AstrBot 管理员可访问的插件配置编辑页面中保存和修改；自定义密码掩码页面不属于 MVP。
 - Token 轮换后立即使旧连接失效。
 - 日志、通知、命令输出、异常信息和状态 JSON 均不得泄露 Token 或其派生标识。
 - 非法连接仅记录脱敏且限频的安全日志，不触发群通知。
@@ -351,14 +351,14 @@ WebUI 仅提供以下配置：
 
 ```caddyfile
 watchdog.example.com {
-    reverse_proxy /napcat-watchdog/ws 127.0.0.1:19090
+    reverse_proxy /napcat-watchdog/ws astrbot:19090
 }
 ```
 
 对应 WebUI 配置示例：
 
 ```text
-listen_host = 127.0.0.1
+listen_host = 0.0.0.0
 listen_port = 19090
 ws_path = /napcat-watchdog/ws
 public_ws_url = wss://watchdog.example.com/napcat-watchdog/ws
@@ -366,7 +366,7 @@ public_ws_url = wss://watchdog.example.com/napcat-watchdog/ws
 
 部署要求如下：
 
-- 插件默认本地端口不直接暴露到公网。
+- 插件监听端口仅通过 Docker 内部网络提供给 Caddy，不直接映射到宿主机公网。
 - Caddy 负责公网 DNS、证书和 TLS 终止。
 - 修改 `ws_path` 时，Caddy 路由、`public_ws_url` 和 NapCat 地址必须同步修改。
 - 示例不包含真实域名、服务器地址或凭据。
