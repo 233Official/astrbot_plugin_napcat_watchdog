@@ -48,16 +48,67 @@ logger = _Logger()
 ASTRBOT_EVENT_INIT = """
 from __future__ import annotations
 
+from enum import Enum
+
+
+class PermissionType(Enum):
+    ADMIN = "admin"
+
+
 class AstrMessageEvent:
+    def __init__(self):
+        self.unified_msg_origin: str = ""
+        self._sender_id: str = ""
+
     def plain_result(self, text: str) -> str:
         return text
 
+    def is_private_chat(self) -> bool:
+        return False
+
+    def get_sender_id(self) -> str:
+        return self._sender_id
+
+
+class _CommandGroup:
+    \"\"\"Stub for AstrBot's command group decorator.\"\"\"
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._func = None
+
+    def __call__(self, func):  # type: ignore[override]
+        \"\"\"Called when the object is used as a decorator (group method).\"\"\"
+        self._func = func
+        func._cmd_group = self._name
+        return self
+
+    def command(self, sub_name: str):
+        \"\"\"Return a decorator for subcommand methods.\"\"\"
+        def deco(f):
+            f._sub_cmd = f"{self._name} {sub_name}"
+            return f
+        return deco
+
+
 class _Filter:
+    PermissionType = PermissionType  # make filter.PermissionType accessible
+
     def command(self, name: str):
         def deco(f):
             f._cmd = name
             return f
         return deco
+
+    def command_group(self, name: str) -> _CommandGroup:
+        return _CommandGroup(name)
+
+    def permission_type(self, perm: PermissionType):
+        def deco(f):
+            f._perm = perm
+            return f
+        return deco
+
 
 filter = _Filter()
 """
@@ -168,7 +219,7 @@ class TestRuntimeImport:
 
 
 class TestInitializeFailClosed:
-    """initialize() must fail closed when StarTools.get_data_dir() fails."""
+    """initialize() must fail closed on various errors."""
 
     async def test_initialize_raises_on_get_data_dir_error(
         self,
@@ -238,3 +289,57 @@ class TestInitializeFailClosed:
             assert not source_data.exists()
         finally:
             main_mod.StarTools.get_data_dir = original
+
+    async def test_initialize_raises_on_corrupt_subscriptions(
+        self,
+        plugin_package: str,
+    ) -> None:
+        """Corrupt subscription file causes initialize to raise; WS stays None."""
+        import json
+        import shutil
+        import tempfile
+
+        main_mod = importlib.import_module(plugin_package)
+        astrbot_api = importlib.import_module("astrbot.api")
+
+        # Point data_dir to a known temporary directory
+        fixed_dir = Path(tempfile.mkdtemp(prefix="napcat_sub_test_"))
+        original = main_mod.StarTools.get_data_dir
+
+        def _fixed_dir(plugin_name: str | None = None) -> str:
+            return str(fixed_dir)
+
+        try:
+            main_mod.StarTools.get_data_dir = _fixed_dir
+            # Create a valid state snapshot (empty)
+            state_path = fixed_dir / "napcat_watchdog_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "_schema_version": 1,
+                        "qq_states": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Create a corrupt subscription file
+            sub_path = fixed_dir / "subscriptions.json"
+            sub_path.write_text("{corrupt json", encoding="utf-8")
+
+            context = main_mod.Context()
+            config = astrbot_api.AstrBotConfig()
+            config["access_token"] = "pre-set-test-token"
+            config["offline_timeout_seconds"] = 90
+            config["listen_host"] = "127.0.0.1"
+            config["listen_port"] = 0
+            config["ws_path"] = "/ws"
+
+            plugin = main_mod.NapCatWatchdogPlugin(context, config)
+            with pytest.raises(Exception, match="Corrupt subscription"):
+                await plugin.initialize()
+
+            # WS server should NOT have been created or started
+            assert plugin._ws_server is None
+        finally:
+            main_mod.StarTools.get_data_dir = original
+            shutil.rmtree(fixed_dir, ignore_errors=True)

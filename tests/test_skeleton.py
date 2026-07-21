@@ -1,8 +1,8 @@
-"""AST-level structural tests for plugin skeleton integrity.
+"""AST-level structural tests for plugin skeleton integrity (Issue #4).
 
 These tests parse main.py without importing AstrBot,
 verifying that auto-discovery, lifecycle, and command
-structure remain intact.
+group structure remain intact.
 """
 
 from __future__ import annotations
@@ -41,8 +41,12 @@ def test_plugin_uses_star_auto_discovery_without_register() -> None:
     assert "import register" not in source, "Should not import 'register'"
 
 
-def test_plugin_exposes_required_lifecycle_and_status_command() -> None:
-    """Plugin has __init__, initialize, terminate, and napcat_watchdog_status."""
+def test_plugin_exposes_required_lifecycle_and_command_group() -> None:
+    """Plugin has __init__, initialize, terminate, and napcat_watchdog command group.
+
+    The old ``napcat_watchdog_status`` single-command pattern must be
+    removed in favour of the command group with subcommands.
+    """
     plugin = _plugin_class(_parse_main())
     methods = {
         node.name: node
@@ -50,6 +54,7 @@ def test_plugin_exposes_required_lifecycle_and_status_command() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
+    # --- Lifecycle ---
     constructor = methods["__init__"]
     assert [argument.arg for argument in constructor.args.args] == [
         "self",
@@ -59,20 +64,62 @@ def test_plugin_exposes_required_lifecycle_and_status_command() -> None:
     assert isinstance(methods["initialize"], ast.AsyncFunctionDef)
     assert isinstance(methods["terminate"], ast.AsyncFunctionDef)
 
-    status = methods["status"]
-    assert isinstance(status, ast.AsyncFunctionDef)
-    assert any(
+    # --- Command group method ---
+    napcat = methods["napcat_watchdog"]
+    assert isinstance(napcat, ast.FunctionDef)  # not async
+
+    has_group_deco = any(
         isinstance(decorator, ast.Call)
         and isinstance(decorator.func, ast.Attribute)
-        and decorator.func.attr == "command"
+        and decorator.func.attr == "command_group"
         and decorator.args
         and isinstance(decorator.args[0], ast.Constant)
-        and decorator.args[0].value == "napcat_watchdog_status"
-        for decorator in status.decorator_list
+        and decorator.args[0].value == "napcat_watchdog"
+        for decorator in napcat.decorator_list
     )
-    # Status text should mention the WS phase (not the old skeleton message)
-    status_unparse = ast.unparse(status)
-    assert "NapCat Watchdog" in status_unparse
+    assert has_group_deco, (
+        "napcat_watchdog method must have @filter.command_group('napcat_watchdog')"
+    )
+
+    # --- Subcommands ---
+    for sub in ("subscribe", "unsubscribe", "status"):
+        assert sub in methods, f"Missing subcommand: {sub}"
+        sub_node = methods[sub]
+        assert isinstance(sub_node, ast.AsyncFunctionDef), (
+            f"Subcommand {sub} must be async"
+        )
+
+        # Verify @filter.permission_type decorator exists
+        has_perm = any(
+            isinstance(d, ast.Call)
+            and isinstance(d.func, ast.Attribute)
+            and d.func.attr == "permission_type"
+            for d in sub_node.decorator_list
+        )
+        assert has_perm, f"Subcommand {sub} must have @filter.permission_type decorator"
+
+    # --- Old single-command must be removed ---
+    old_status = next(
+        (
+            node
+            for node in plugin.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr == "command"
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Constant)
+                and decorator.args[0].value == "napcat_watchdog_status"
+                for decorator in node.decorator_list
+            )
+        ),
+        None,
+    )
+    assert old_status is None, (
+        "Old 'napcat_watchdog_status' command must be removed; "
+        "use napcat_watchdog command group instead"
+    )
 
 
 def test_configuration_schema_has_all_required_fields() -> None:

@@ -45,6 +45,10 @@ class FakeWall:
     def advance(self, delta: float) -> None:
         self._time += delta
 
+    def set(self, t: float) -> None:
+        """Set wall clock to an absolute value."""
+        self._time = t
+
     def __call__(self) -> float:
         return self._time
 
@@ -302,6 +306,35 @@ class TestHeartbeat:
         g = sm.confirm_connection(1)
         sm.on_heartbeat(1, g, True)
         assert sm.online_count == 1
+
+    async def test_heartbeat_sets_last_heartbeat_at(self) -> None:
+        """Valid heartbeat updates last_heartbeat_at wall-clock field."""
+        wall = FakeWall()
+        mono = FakeMono()
+        sm = make_sm(mono=mono, wall=wall)
+        wall.set(2000.0)
+        mono.advance(5.0)
+
+        await sm.try_reserve(1)
+        g = sm.confirm_connection(1)
+
+        # Before any heartbeat, last_heartbeat_at is None
+        view_before = sm.get_view(1)
+        assert view_before is not None
+        assert view_before.get("last_heartbeat_at") is None
+
+        # Send heartbeat(true)
+        sm.on_heartbeat(1, g, True)
+        view_after = sm.get_view(1)
+        assert view_after is not None
+        assert view_after["last_heartbeat_at"] == 2000.0
+
+        # Send heartbeat(false)
+        wall.set(3000.0)
+        sm.on_heartbeat(1, g, False)
+        view_after2 = sm.get_view(1)
+        assert view_after2 is not None
+        assert view_after2["last_heartbeat_at"] == 3000.0
 
     async def test_heartbeat_false_triggers_signal(self) -> None:
         mono = FakeMono()
@@ -808,6 +841,7 @@ class TestSnapshotRoundTrip:
         assert "generation" not in entry
         assert "last_heartbeat_mono" not in entry
         assert "last_heartbeat_time" not in entry
+        assert "last_heartbeat_at" not in entry
         assert "connection_established_mono" not in entry
         assert "notified_online" not in entry
         assert "notified_offline" not in entry

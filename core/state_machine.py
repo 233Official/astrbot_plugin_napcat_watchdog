@@ -173,6 +173,7 @@ class _QQData:
     # Runtime-only — never persisted
     connection_established_mono: float | None = None
     last_heartbeat_mono: float = 0.0  # 0.0 = never received
+    last_heartbeat_at: float | None = None  # wall-clock UTC epoch; None = never
     signals: _Signals = field(default_factory=_Signals)
     pending_timer: asyncio.Task[None] | None = None
 
@@ -513,6 +514,7 @@ class StateMachine:
 
         now_mono = self._monotonic()
         state.last_heartbeat_mono = now_mono
+        state.last_heartbeat_at = self._wall()
 
         if online:
             # ---- Heartbeat says online ----
@@ -727,6 +729,7 @@ class StateMachine:
             "registered_at": state.registered_at,
             "last_status_change": state.last_status_change,
             "offline_since": state.offline_since,
+            "last_heartbeat_at": state.last_heartbeat_at,
         }
 
     def get_all_views(self) -> dict[str, Any]:
@@ -744,6 +747,7 @@ class StateMachine:
                 "registered_at": s.registered_at,
                 "last_status_change": s.last_status_change,
                 "offline_since": s.offline_since,
+                "last_heartbeat_at": s.last_heartbeat_at,
             }
         return out
 
