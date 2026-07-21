@@ -71,6 +71,12 @@ class Context:
 class Star:
     def __init__(self, context: Context, config: object) -> None:
         pass
+
+class StarTools:
+    @staticmethod
+    def get_data_dir(plugin_name: str) -> str:
+        import tempfile
+        return tempfile.mkdtemp(prefix=f"{plugin_name}_")
 """
 
 
@@ -81,7 +87,7 @@ def plugin_package(tmp_path: Path) -> Generator[str, None, None]:
     Yields the dotted module path ``"astrbot_plugin_napcat_watchdog.main"``
     that can be imported after this fixture is set up.
     """
-    # --- 1. Create astrbot stub package (mirrors AstrBot's module structure) ---
+    # --- 1. Create astrbot stub package ---
     astrbot_pkg = tmp_path / "astrbot"
     astrbot_pkg.mkdir()
     (astrbot_pkg / "__init__.py").write_text("")
@@ -103,10 +109,8 @@ def plugin_package(tmp_path: Path) -> Generator[str, None, None]:
     plugin_pkg.mkdir()
     (plugin_pkg / "__init__.py").write_text("")
 
-    # Symlink main.py
     (plugin_pkg / "main.py").symlink_to(ROOT / "main.py")
 
-    # Symlink the entire core/ subpackage
     core_symlink = plugin_pkg / "core"
     core_symlink.symlink_to(ROOT / "core", target_is_directory=True)
 
@@ -137,6 +141,7 @@ class TestRuntimeImport:
         assert hasattr(main_mod, "Star")
         assert hasattr(main_mod, "WatchdogWSServer")
         assert hasattr(main_mod, "ensure_access_token")
+        assert hasattr(main_mod, "StateMachine")
 
         # Verify class hierarchy
         assert issubclass(main_mod.NapCatWatchdogPlugin, main_mod.Star)
@@ -160,3 +165,76 @@ class TestRuntimeImport:
         assert hasattr(main_mod.NapCatWatchdogPlugin, "initialize")
         assert hasattr(main_mod.NapCatWatchdogPlugin, "terminate")
         assert hasattr(main_mod.NapCatWatchdogPlugin, "status")
+
+
+class TestInitializeFailClosed:
+    """initialize() must fail closed when StarTools.get_data_dir() fails."""
+
+    async def test_initialize_raises_on_get_data_dir_error(
+        self,
+        plugin_package: str,
+    ) -> None:
+        """When get_data_dir raises, initialize() must raise and WS stays None."""
+        main_mod = importlib.import_module(plugin_package)
+        astrbot_api = importlib.import_module("astrbot.api")
+
+        original = main_mod.StarTools.get_data_dir
+
+        def _failing(plugin_name: str | None = None) -> str:
+            raise PermissionError("模拟无权限")
+
+        try:
+            main_mod.StarTools.get_data_dir = _failing
+
+            context = main_mod.Context()
+            config = astrbot_api.AstrBotConfig()
+            config["access_token"] = "pre-set-test-token"
+            config["offline_timeout_seconds"] = 90
+            config["listen_host"] = "127.0.0.1"
+            config["listen_port"] = 0
+            config["ws_path"] = "/ws"
+
+            plugin = main_mod.NapCatWatchdogPlugin(context, config)
+            with pytest.raises(Exception):
+                await plugin.initialize()
+
+            # WS server should NOT have been created or started
+            assert plugin._ws_server is None
+        finally:
+            main_mod.StarTools.get_data_dir = original
+
+    async def test_initialize_does_not_write_source_data_dir(
+        self,
+        plugin_package: str,
+    ) -> None:
+        """After failed initialize, no data/ directory in plugin source root."""
+        main_mod = importlib.import_module(plugin_package)
+        astrbot_api = importlib.import_module("astrbot.api")
+
+        source_data = Path(__file__).resolve().parents[1] / "data"
+        assert not source_data.exists(), "Precondition: no source data/ dir"
+
+        original = main_mod.StarTools.get_data_dir
+
+        def _failing(plugin_name: str | None = None) -> str:
+            raise PermissionError("模拟无权限")
+
+        try:
+            main_mod.StarTools.get_data_dir = _failing
+
+            context = main_mod.Context()
+            config = astrbot_api.AstrBotConfig()
+            config["access_token"] = "pre-set-test-token"
+            config["offline_timeout_seconds"] = 90
+            config["listen_host"] = "127.0.0.1"
+            config["listen_port"] = 0
+            config["ws_path"] = "/ws"
+
+            plugin = main_mod.NapCatWatchdogPlugin(context, config)
+            with pytest.raises(Exception):
+                await plugin.initialize()
+
+            # Source data/ directory must not be created
+            assert not source_data.exists()
+        finally:
+            main_mod.StarTools.get_data_dir = original

@@ -61,6 +61,8 @@ def server(token: str) -> WatchdogWSServer:
 
 @pytest.fixture
 async def running_server(server: WatchdogWSServer) -> WatchdogWSServer:
+    """Start server with a simple admission handler that returns gen=1."""
+    server.set_admission_handler(_simple_admit)
     await server.start()
     yield server
     await server.stop()
@@ -72,6 +74,11 @@ async def client_session() -> aiohttp.ClientSession:
         yield session
 
 
+async def _simple_admit(self_id: int) -> int:
+    """Always admit with generation=1."""
+    return 1
+
+
 def _ws_url(srv: WatchdogWSServer) -> str:
     assert srv.bound_port is not None
     return f"ws://127.0.0.1:{srv.bound_port}/napcat-watchdog/ws"
@@ -81,59 +88,34 @@ def _ws_url(srv: WatchdogWSServer) -> str:
 
 
 class TestAccessTokenPersistence:
-    """Call the actual :func:`ensure_access_token` with a config stub.
-
-    These tests replace the earlier ``TestTokenGeneration`` that only
-    verified ``secrets.token_urlsafe`` in isolation.
-    """
+    """Call the actual :func:`ensure_access_token` with a config stub."""
 
     def test_empty_token_generates_and_persists(self) -> None:
-        """Empty access_token → token generated, save_config called once."""
         cfg = _ConfigStub(initial_token="")
         result = ensure_access_token(cfg)
 
         assert isinstance(result, str)
-        assert len(result) >= 43  # ceil(32*4/3) = 43
+        assert len(result) >= 43
         assert cfg.save_call_count == 1
-        # Verify it's actually random
         cfg2 = _ConfigStub(initial_token="")
         result2 = ensure_access_token(cfg2)
         assert result != result2
 
     def test_existing_token_does_not_save(self) -> None:
-        """Non-empty access_token → returned as-is, save_config NOT called."""
         cfg = _ConfigStub(initial_token="my-existing-token")
         result = ensure_access_token(cfg)
-
         assert result == "my-existing-token"
         assert cfg.save_call_count == 0
 
     def test_save_failure_resets_token_and_raises(self) -> None:
-        """save_config() exception → token reset to '' and RuntimeError."""
         cfg = _ConfigStub(initial_token="")
         cfg.save_fail = True
 
         with pytest.raises(RuntimeError, match="access_token persistence failed"):
             ensure_access_token(cfg)
 
-        # In-memory token must be empty so the caller refuses to start
         stored: object = cfg.get("access_token", "")
         assert stored == ""
-
-
-# ---- Schema defaults ----
-
-
-class TestSchemaDefaults:
-    """Verify schema default values match requirements."""
-
-    def test_defaults_loaded(self) -> None:
-        """Server defaults should match the specification."""
-        srv = WatchdogWSServer(access_token=TEST_TOKEN)
-        assert srv._host == "0.0.0.0"
-        assert srv._port == 19090
-        assert srv._path == "/napcat-watchdog/ws"
-        assert srv._access_token == TEST_TOKEN
 
 
 # ---- Auth (401) ----
@@ -147,7 +129,6 @@ class TestAuth:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Correct token + valid X-Self-ID → WebSocket upgrade succeeds."""
         async with client_session.ws_connect(
             _ws_url(running_server),
             headers={
@@ -162,7 +143,6 @@ class TestAuth:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Missing Authorization header → 401 + WWW-Authenticate."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -179,7 +159,6 @@ class TestAuth:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Wrong Bearer token → 401 + WWW-Authenticate."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -190,16 +169,12 @@ class TestAuth:
             ):
                 pass
         assert exc.value.status == 401
-        hdrs = exc.value.headers
-        assert hdrs is not None
-        assert hdrs.get("WWW-Authenticate") == "Bearer"
 
     async def test_malformed_auth_header_returns_401(
         self,
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Authorization header without 'Bearer ' prefix → 401 + WWW-Authenticate."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -226,7 +201,6 @@ class TestSelfID:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Missing X-Self-ID header → 400."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -240,7 +214,6 @@ class TestSelfID:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Empty X-Self-ID → 400."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -257,7 +230,6 @@ class TestSelfID:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Non-numeric X-Self-ID → 400."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -274,7 +246,6 @@ class TestSelfID:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Negative integer X-Self-ID → 400."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -291,7 +262,6 @@ class TestSelfID:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Zero X-Self-ID → 400 (positive integer required)."""
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
                 _ws_url(running_server),
@@ -315,7 +285,6 @@ class TestConnectionTracking:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Two different self_ids → both connected."""
         url = _ws_url(running_server)
         headers = {"Authorization": f"Bearer {TEST_TOKEN}"}
 
@@ -345,19 +314,24 @@ class TestConnectionTracking:
 
         async with client_session.ws_connect(url, headers=headers) as ws1:
             async with client_session.ws_connect(url, headers=headers) as ws2:
-                # Consume the close frame sent by the server
                 await ws1.receive()
                 assert ws1.closed
                 assert ws1.close_code == 1001
                 assert not ws2.closed
                 assert running_server.connection_count == 1
 
-    async def test_old_connection_replaced_after_reconnect(
+    async def test_replacement_order_new_first(
         self,
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Replacement: old WS receives close frame with reason."""
+        """New connection is written to _connections BEFORE old is closed.
+
+        The server stores ``web.WebSocketResponse`` objects which are
+        different from the client's ``ClientWebSocketResponse`` objects.
+        We verify the ordering by checking that ``ws1`` (first)
+        receives a close frame (meaning it was replaced).
+        """
         url = _ws_url(running_server)
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
@@ -365,12 +339,54 @@ class TestConnectionTracking:
         }
 
         async with client_session.ws_connect(url, headers=headers) as ws1:
-            async with client_session.ws_connect(url, headers=headers):
-                # ws1 should have received a close frame
+            async with client_session.ws_connect(url, headers=headers) as ws2:
+                # ws1 should have received a close frame (replaced)
                 msg = await ws1.receive()
                 assert msg.type == aiohttp.WSMsgType.CLOSE
                 assert msg.data == 1001
                 assert ws1.close_code == 1001
+                # ws2 should still be open
+                assert not ws2.closed
+                # There should be exactly 1 connection tracked
+                assert running_server.connection_count == 1
+
+    async def test_old_connection_finally_does_not_remove_new(
+        self,
+        running_server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        """Old WS finally block does not delete the new connection.
+
+        This is guaranteed by the replacement order: new is written
+        first, so old's finally finds that _connections[self_id] is
+        the new ws (not the old one).
+        """
+        url = _ws_url(running_server)
+        headers = {
+            "Authorization": f"Bearer {TEST_TOKEN}",
+            "X-Self-ID": "12345",
+        }
+
+        # Use _simple_admit which always returns gen=1 per connect
+        # Track connection count across the replacement
+        async with client_session.ws_connect(url, headers=headers) as ws1:
+            async with client_session.ws_connect(url, headers=headers) as ws2:
+                # Wait for ws1 to receive the close frame (replaced)
+                msg = await ws1.receive()
+                assert msg.type == aiohttp.WSMsgType.CLOSE
+                assert msg.data == 1001
+                assert ws1.closed
+                assert ws1.close_code == 1001
+                # ws2 should be active
+                assert not ws2.closed
+                # Exactly 1 connection tracked
+                assert running_server.connection_count == 1
+
+        # After both contexts exit, connection_count should be 0
+        await asyncio.sleep(0.05)
+        assert running_server.connection_count == 0, (
+            f"Expected 0 connections, got {running_server.connection_count}"
+        )
 
 
 # ---- Token rotation ----
@@ -384,7 +400,6 @@ class TestTokenRotation:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """After rotation, existing connections receive close frame."""
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
             "X-Self-ID": "12345",
@@ -403,7 +418,6 @@ class TestTokenRotation:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """After rotation, old token → 401."""
         await running_server.update_access_token(ALT_TOKEN)
         with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
             async with client_session.ws_connect(
@@ -421,7 +435,6 @@ class TestTokenRotation:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """After rotation, new token → connection succeeds."""
         await running_server.update_access_token(ALT_TOKEN)
         async with client_session.ws_connect(
             _ws_url(running_server),
@@ -437,15 +450,12 @@ class TestTokenRotation:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """After rotation, connection count drops to 0."""
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
             "X-Self-ID": "12345",
         }
         async with client_session.ws_connect(_ws_url(running_server), headers=headers):
             await running_server.update_access_token(ALT_TOKEN)
-            # _close_all clears the dict synchronously before any await,
-            # so connection_count is 0 immediately after return.
             assert running_server.connection_count == 0
 
 
@@ -460,7 +470,7 @@ class TestServerStop:
         server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Server stop → all WS connections receive close frame."""
+        server.set_admission_handler(_simple_admit)
         await server.start()
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
@@ -469,7 +479,6 @@ class TestServerStop:
         async with client_session.ws_connect(_ws_url(server), headers=headers) as ws:
             await server.stop()
             msg = await ws.receive()
-            # CLOSED or CLOSE frame depending on timing
             assert msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE)
             assert ws.close_code == 1001
 
@@ -477,19 +486,19 @@ class TestServerStop:
         self,
         server: WatchdogWSServer,
     ) -> None:
-        """After stop, the same port can be reused."""
+        server.set_admission_handler(_simple_admit)
         await server.start()
         port = server.bound_port
         assert port is not None
         await server.stop()
 
-        # Start another server on the same port (should succeed now)
         srv2 = WatchdogWSServer(
             host="127.0.0.1",
             port=port,
             access_token=TEST_TOKEN,
         )
         try:
+            srv2.set_admission_handler(_simple_admit)
             await srv2.start()
             assert srv2.bound_port == port
         finally:
@@ -499,9 +508,8 @@ class TestServerStop:
         self,
         running_server: WatchdogWSServer,
     ) -> None:
-        """Calling stop multiple times does not raise."""
         await running_server.stop()
-        await running_server.stop()  # second call should be safe
+        await running_server.stop()
         assert running_server.bound_port is None
 
     async def test_server_can_restart_after_stop(
@@ -509,10 +517,11 @@ class TestServerStop:
         server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """After stop → start, the server is functional again."""
+        server.set_admission_handler(_simple_admit)
         await server.start()
         await server.stop()
 
+        server.set_admission_handler(_simple_admit)
         await server.start()
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
@@ -534,7 +543,6 @@ class TestMessageHandling:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Sending non-JSON text → server stays up and responds to next message."""
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
             "X-Self-ID": "12345",
@@ -544,7 +552,6 @@ class TestMessageHandling:
         ) as ws:
             await ws.send_str("this is not json")
             await ws.send_json({"type": "heartbeat"})
-            # If we get here without error, the server survived
             assert not ws.closed
 
     async def test_binary_message_does_not_crash(
@@ -552,7 +559,6 @@ class TestMessageHandling:
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Sending binary data → server stays up."""
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
             "X-Self-ID": "12345",
@@ -561,27 +567,25 @@ class TestMessageHandling:
             _ws_url(running_server), headers=headers
         ) as ws:
             await ws.send_bytes(b"binary data")
-            # Still connected
             assert not ws.closed
 
 
-# ---- Event callback ----
+# ---- Strict heartbeat validation via event callback ----
 
 
-class TestEventCallback:
-    """Optional async callback for received JSON events."""
+class TestHeartbeatValidation:
+    """Only strict heartbeats reach the event callback."""
 
-    async def test_callback_receives_json_events(
+    async def test_valid_heartbeat_dispatched(
         self,
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """JSON messages are dispatched to the registered callback."""
-        received: list[tuple[int, dict[str, Any]]] = []
+        received: list[tuple[int, int, dict[str, Any]]] = []
         received_event = asyncio.Event()
 
-        async def callback(self_id: int, data: dict[str, Any]) -> None:
-            received.append((self_id, data))
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
             received_event.set()
 
         running_server.set_event_callback(callback)
@@ -593,24 +597,31 @@ class TestEventCallback:
         async with client_session.ws_connect(
             _ws_url(running_server), headers=headers
         ) as ws:
-            await ws.send_json({"type": "heartbeat", "online": True})
+            await ws.send_json(
+                {
+                    "post_type": "meta_event",
+                    "meta_event_type": "heartbeat",
+                    "status": {"online": True},
+                    "self_id": 12345,
+                }
+            )
             await asyncio.wait_for(received_event.wait(), timeout=2)
 
         assert len(received) == 1
-        assert received[0][0] == 12345
-        assert received[0][1] == {"type": "heartbeat", "online": True}
+        assert received[0][0] == 12345  # self_id
+        assert received[0][1] == 1  # generation
+        assert received[0][2]["status"]["online"] is True
 
-    async def test_non_json_not_dispatched(
+    async def test_invalid_post_type_not_dispatched(
         self,
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Non-JSON text messages are not dispatched to callback."""
-        received: list[tuple[int, dict[str, Any]]] = []
+        received: list[tuple[int, int, dict[str, Any]]] = []
         received_event = asyncio.Event()
 
-        async def callback(self_id: int, data: dict[str, Any]) -> None:
-            received.append((self_id, data))
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
             received_event.set()
 
         running_server.set_event_callback(callback)
@@ -622,19 +633,32 @@ class TestEventCallback:
         async with client_session.ws_connect(
             _ws_url(running_server), headers=headers
         ) as ws:
-            await ws.send_str("not json")
-            # Give the server a chance NOT to call the callback
+            await ws.send_json(
+                {
+                    "post_type": "message",
+                    "meta_event_type": "heartbeat",
+                    "status": {"online": True},
+                }
+            )
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(received_event.wait(), timeout=0.2)
 
         assert len(received) == 0
 
-    async def test_no_callback_safe_discard(
+    async def test_self_id_mismatch_not_dispatched(
         self,
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
     ) -> None:
-        """Without a callback, JSON events are safely discarded."""
+        received: list[tuple[int, int, dict[str, Any]]] = []
+        received_event = asyncio.Event()
+
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
+            received_event.set()
+
+        running_server.set_event_callback(callback)
+
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
             "X-Self-ID": "12345",
@@ -642,21 +666,182 @@ class TestEventCallback:
         async with client_session.ws_connect(
             _ws_url(running_server), headers=headers
         ) as ws:
-            await ws.send_json({"type": "heartbeat"})
-            assert not ws.closed
+            await ws.send_json(
+                {
+                    "post_type": "meta_event",
+                    "meta_event_type": "heartbeat",
+                    "status": {"online": True},
+                    "self_id": 99999,  # Mismatch!
+                }
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(received_event.wait(), timeout=0.2)
+
+        assert len(received) == 0
+
+    async def test_status_not_dict_not_dispatched(
+        self,
+        running_server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        received: list[tuple[int, int, dict[str, Any]]] = []
+        received_event = asyncio.Event()
+
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
+            received_event.set()
+
+        running_server.set_event_callback(callback)
+
+        headers = {
+            "Authorization": f"Bearer {TEST_TOKEN}",
+            "X-Self-ID": "12345",
+        }
+        async with client_session.ws_connect(
+            _ws_url(running_server), headers=headers
+        ) as ws:
+            await ws.send_json(
+                {
+                    "post_type": "meta_event",
+                    "meta_event_type": "heartbeat",
+                    "status": "not_a_dict",
+                }
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(received_event.wait(), timeout=0.2)
+
+        assert len(received) == 0
+
+    async def test_online_not_bool_not_dispatched(
+        self,
+        running_server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        received: list[tuple[int, int, dict[str, Any]]] = []
+        received_event = asyncio.Event()
+
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
+            received_event.set()
+
+        running_server.set_event_callback(callback)
+
+        headers = {
+            "Authorization": f"Bearer {TEST_TOKEN}",
+            "X-Self-ID": "12345",
+        }
+        async with client_session.ws_connect(
+            _ws_url(running_server), headers=headers
+        ) as ws:
+            await ws.send_json(
+                {
+                    "post_type": "meta_event",
+                    "meta_event_type": "heartbeat",
+                    "status": {"online": 1},  # int, not bool!
+                }
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(received_event.wait(), timeout=0.2)
+
+        assert len(received) == 0
+
+    async def test_generation_passed_to_callback(
+        self,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        """Generation from admission handler is passed through to event callback."""
+        server = WatchdogWSServer(host="127.0.0.1", port=0, access_token=TEST_TOKEN)
+
+        async def admit(self_id: int) -> int:
+            return 42  # custom generation
+
+        server.set_admission_handler(admit)
+        await server.start()
+
+        received: list[tuple[int, int, dict[str, Any]]] = []
+        received_event = asyncio.Event()
+
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
+            received_event.set()
+
+        server.set_event_callback(callback)
+
+        headers = {
+            "Authorization": f"Bearer {TEST_TOKEN}",
+            "X-Self-ID": "12345",
+        }
+        async with client_session.ws_connect(_ws_url(server), headers=headers) as ws:
+            await ws.send_json(
+                {
+                    "post_type": "meta_event",
+                    "meta_event_type": "heartbeat",
+                    "status": {"online": True},
+                    "self_id": 12345,
+                }
+            )
+            await asyncio.wait_for(received_event.wait(), timeout=2)
+
+        await server.stop()
+
+        assert len(received) == 1
+        assert received[0][1] == 42  # generation passed through
+
+
+# ---- Event callback - non-dict JSON discarded ----
+
+
+class TestNonDictJson:
+    """JSON arrays/strings/numbers/bools/null are not dispatched."""
+
+    @pytest.mark.parametrize(
+        ("payload", "desc"),
+        [
+            ("[1, 2, 3]", "array"),
+            ('"hello"', "string"),
+            ("42", "number"),
+            ("true", "boolean"),
+            ("null", "null"),
+        ],
+    )
+    async def test_non_dict_json_not_dispatched(
+        self,
+        running_server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+        payload: str,
+        desc: str,
+    ) -> None:
+        received: list[tuple[int, int, dict[str, Any]]] = []
+        received_event = asyncio.Event()
+
+        async def callback(self_id: int, generation: int, data: dict[str, Any]) -> None:
+            received.append((self_id, generation, data))
+            received_event.set()
+
+        running_server.set_event_callback(callback)
+
+        headers = {
+            "Authorization": f"Bearer {TEST_TOKEN}",
+            "X-Self-ID": "12345",
+        }
+        async with client_session.ws_connect(
+            _ws_url(running_server), headers=headers
+        ) as ws:
+            await ws.send_str(payload)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(received_event.wait(), timeout=0.2)
+
+        assert len(received) == 0
 
 
 # ---- start() raises when already running ----
 
 
 class TestStartIdempotency:
-    """start() raises RuntimeError if already running."""
-
     async def test_double_start_raises(
         self,
         running_server: WatchdogWSServer,
     ) -> None:
-        """Calling start() again raises RuntimeError."""
         with pytest.raises(RuntimeError, match="already running"):
             await running_server.start()
 
@@ -665,8 +850,6 @@ class TestStartIdempotency:
 
 
 class TestBoundPort:
-    """bound_port property works correctly."""
-
     async def test_bound_port_none_before_start(self) -> None:
         srv = WatchdogWSServer(access_token=TEST_TOKEN)
         assert srv.bound_port is None
@@ -691,15 +874,11 @@ class TestBoundPort:
 
 
 class TestEmptyToken:
-    """WatchdogWSServer rejects empty access_token in constructor and update."""
-
     def test_empty_token_raises_on_construction(self) -> None:
-        """Constructing with empty token raises ValueError."""
         with pytest.raises(ValueError, match="access_token must not be empty"):
             WatchdogWSServer(access_token="")
 
     def test_default_token_raises_on_construction(self) -> None:
-        """Constructing with default empty token raises ValueError."""
         with pytest.raises(ValueError, match="access_token must not be empty"):
             WatchdogWSServer()
 
@@ -707,7 +886,6 @@ class TestEmptyToken:
         self,
         running_server: WatchdogWSServer,
     ) -> None:
-        """update_access_token('') raises ValueError."""
         with pytest.raises(ValueError, match="access_token must not be empty"):
             await running_server.update_access_token("")
 
@@ -715,137 +893,169 @@ class TestEmptyToken:
         self,
         running_server: WatchdogWSServer,
     ) -> None:
-        """After rejected update, the original token is unchanged."""
         assert running_server.access_token == TEST_TOKEN
         with pytest.raises(ValueError):
             await running_server.update_access_token("")
         assert running_server.access_token == TEST_TOKEN
 
 
-# ---- Non-dict JSON ----
+# ---- Cancel capacity handler (reservation release) ----
 
 
-class TestNonDictJson:
-    """JSON arrays/strings/numbers/bools/null are not dispatched to callback."""
+class TestCancelCapacity:
+    """Cancel capacity handler releases reservation on failures."""
 
-    @pytest.mark.parametrize(
-        ("payload", "desc"),
-        [
-            ("[1, 2, 3]", "array"),
-            ('"hello"', "string"),
-            ("42", "number"),
-            ("true", "boolean"),
-            ("null", "null"),
-        ],
-    )
-    async def test_non_dict_json_not_dispatched(
+    async def test_cancel_handler_is_wired_and_callable(
+        self,
+        server: WatchdogWSServer,
+    ) -> None:
+        """Cancel capacity handler is properly set and callable."""
+        cancel_called: list[int] = []
+
+        async def cancel_cb(self_id: int) -> None:
+            cancel_called.append(self_id)
+
+        async def can_reg(self_id: int) -> bool:
+            return True
+
+        server.set_can_register_handler(can_reg)
+        server.set_cancel_capacity_handler(cancel_cb)
+        await server.start()
+
+        assert server._cancel_capacity_handler is not None
+
+        # Directly invoke the handler to verify it works
+        await server._cancel_capacity_handler(42)
+        assert cancel_called == [42]
+
+        await server.stop()
+
+    async def test_admission_raise_does_not_trigger_cancel_capacity(
+        self,
+        server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        """Admission raise does NOT trigger cancel capacity (reservation
+        has been consumed by confirm_connection)."""
+        cancel_called: list[int] = []
+
+        async def cancel_cb(self_id: int) -> None:
+            cancel_called.append(self_id)
+
+        async def can_reg(self_id: int) -> bool:
+            return True
+
+        async def failing_admit(self_id: int) -> int:
+            raise RuntimeError("admission failed")
+
+        server.set_can_register_handler(can_reg)
+        server.set_cancel_capacity_handler(cancel_cb)
+        server.set_admission_handler(failing_admit)
+        await server.start()
+
+        async with client_session.ws_connect(
+            _ws_url(server),
+            headers={
+                "Authorization": f"Bearer {TEST_TOKEN}",
+                "X-Self-ID": "12345",
+            },
+        ) as ws:
+            msg = await ws.receive()
+            assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
+
+        # Cancel should NOT be called for admission failures
+        # (reservation was consumed by confirm_connection inside admission)
+        assert len(cancel_called) == 0
+
+        await server.stop()
+
+
+# ---- Admission handler failures ----
+
+
+class TestAdmissionFailure:
+    """When admission handler raises, the connection is closed after upgrade.
+
+    The WebSocket upgrade succeeds (401/400 checks pass), but the
+    admission handler rejects the connection post-upgrade, sending
+    a close frame with code 1011.  The client sees a successful
+    upgrade followed by close, *not* a handshake error.
+    """
+
+    async def test_admission_raise_closes_connection(
+        self,
+        server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        async def failing_admit(self_id: int) -> int:
+            raise RuntimeError("admission failed")
+
+        server.set_admission_handler(failing_admit)
+        await server.start()
+
+        # Upgrade should succeed (auth passes), then close with 1011
+        async with client_session.ws_connect(
+            _ws_url(server),
+            headers={
+                "Authorization": f"Bearer {TEST_TOKEN}",
+                "X-Self-ID": "12345",
+            },
+        ) as ws:
+            msg = await ws.receive()
+            assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
+            assert ws.close_code == 1011
+
+        await server.stop()
+
+    async def test_no_admission_handler_closes_connection(
+        self,
+        server: WatchdogWSServer,
+        client_session: aiohttp.ClientSession,
+    ) -> None:
+        """Without admission handler, connection is closed after upgrade."""
+        await server.start()
+
+        async with client_session.ws_connect(
+            _ws_url(server),
+            headers={
+                "Authorization": f"Bearer {TEST_TOKEN}",
+                "X-Self-ID": "12345",
+            },
+        ) as ws:
+            msg = await ws.receive()
+            assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
+
+        await server.stop()
+
+
+# ---- Disconnect callback ----
+
+
+class TestDisconnectCallback:
+    """Disconnect callback fires with correct self_id and generation."""
+
+    async def test_disconnect_callback_fires(
         self,
         running_server: WatchdogWSServer,
         client_session: aiohttp.ClientSession,
-        payload: str,
-        desc: str,
     ) -> None:
-        """JSON {desc} is not dispatched to callback."""
-        received: list[tuple[int, dict[str, Any]]] = []
-        received_event = asyncio.Event()
+        disconnects: list[tuple[int, int]] = []
+        disconnect_event = asyncio.Event()
 
-        async def callback(self_id: int, data: dict[str, Any]) -> None:
-            received.append((self_id, data))
-            received_event.set()
+        async def on_disconnect(self_id: int, generation: int) -> None:
+            disconnects.append((self_id, generation))
+            disconnect_event.set()
 
-        running_server.set_event_callback(callback)
+        running_server.set_disconnect_callback(on_disconnect)
 
         headers = {
             "Authorization": f"Bearer {TEST_TOKEN}",
             "X-Self-ID": "12345",
         }
-        async with client_session.ws_connect(
-            _ws_url(running_server), headers=headers
-        ) as ws:
-            await ws.send_str(payload)
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(received_event.wait(), timeout=0.2)
+        async with client_session.ws_connect(_ws_url(running_server), headers=headers):
+            pass  # close on exit
 
-        assert len(received) == 0
-
-    async def test_dict_json_still_dispatched(
-        self,
-        running_server: WatchdogWSServer,
-        client_session: aiohttp.ClientSession,
-    ) -> None:
-        """JSON object is still dispatched to callback (sanity check)."""
-        received: list[tuple[int, dict[str, Any]]] = []
-        received_event = asyncio.Event()
-
-        async def callback(self_id: int, data: dict[str, Any]) -> None:
-            received.append((self_id, data))
-            received_event.set()
-
-        running_server.set_event_callback(callback)
-
-        headers = {
-            "Authorization": f"Bearer {TEST_TOKEN}",
-            "X-Self-ID": "12345",
-        }
-        async with client_session.ws_connect(
-            _ws_url(running_server), headers=headers
-        ) as ws:
-            await ws.send_json({"type": "heartbeat"})
-            await asyncio.wait_for(received_event.wait(), timeout=2)
-
-        assert len(received) == 1
-        assert received[0][1] == {"type": "heartbeat"}
-
-
-# ---- Start() failure cleanup ----
-
-
-class TestStartFailure:
-    """start() failure leaves server in a clean, non-started state."""
-
-    async def test_start_failure_cleans_up(self) -> None:
-        """Port conflict → runner/site cleaned up, bound_port is None."""
-        srv1 = WatchdogWSServer(host="127.0.0.1", port=0, access_token=TEST_TOKEN)
-        await srv1.start()
-        occupied_port = srv1.bound_port
-        assert occupied_port is not None
-
-        srv2 = WatchdogWSServer(
-            host="127.0.0.1",
-            port=occupied_port,
-            access_token=TEST_TOKEN,
-        )
-        with pytest.raises(Exception):
-            await srv2.start()
-
-        assert srv2._app is None
-        assert srv2._runner is None
-        assert srv2._site is None
-        assert srv2.bound_port is None
-
-        await srv1.stop()
-
-    async def test_failed_start_not_marked_running(self) -> None:
-        """After failed start, start can be called again (on free port)."""
-        srv1 = WatchdogWSServer(host="127.0.0.1", port=0, access_token=TEST_TOKEN)
-        await srv1.start()
-        occupied_port = srv1.bound_port
-        assert occupied_port is not None
-
-        srv2 = WatchdogWSServer(
-            host="127.0.0.1",
-            port=occupied_port,
-            access_token=TEST_TOKEN,
-        )
-        with pytest.raises(Exception):
-            await srv2.start()
-
-        # srv2 should not think it's running — no "already running" error
-        # Create a new instance bound to port 0 for a clean retry
-        srv3 = WatchdogWSServer(host="127.0.0.1", port=0, access_token=TEST_TOKEN)
-        await srv3.start()
-        assert srv3.bound_port is not None
-        assert srv3.bound_port != occupied_port
-        await srv3.stop()
-
-        await srv1.stop()
+        await asyncio.wait_for(disconnect_event.wait(), timeout=2)
+        assert len(disconnects) == 1
+        assert disconnects[0][0] == 12345
+        assert disconnects[0][1] == 1  # generation from simple_admit

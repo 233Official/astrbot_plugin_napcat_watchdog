@@ -27,6 +27,6 @@
   "offline_timeout_seconds": {
     "type": "int",
     "default": 90,
-    "description": "掉线防抖时间（秒）。达到该时长未收到有效心跳或连接断开后确认 NapCat 掉线。当前仅配置占位，状态机尚未实现。"
+    "description": "掉线防抖时间（秒）。达到该时长未收到有效心跳或连接断开后确认 NapCat 掉线。"
   }
 }

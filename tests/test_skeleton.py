@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +35,10 @@ def test_plugin_uses_star_auto_discovery_without_register() -> None:
     plugin = _plugin_class(tree)
 
     assert not plugin.decorator_list
-    assert "register" not in MAIN_PATH.read_text(encoding="utf-8")
+    # Ensure the @register decorator pattern is NOT used on the class
+    source = MAIN_PATH.read_text(encoding="utf-8")
+    assert not re.search(r"@register\b", source), "Class should not use @register"
+    assert "import register" not in source, "Should not import 'register'"
 
 
 def test_plugin_exposes_required_lifecycle_and_status_command() -> None:
@@ -68,7 +72,7 @@ def test_plugin_exposes_required_lifecycle_and_status_command() -> None:
     )
     # Status text should mention the WS phase (not the old skeleton message)
     status_unparse = ast.unparse(status)
-    assert "WS 服务端" in status_unparse
+    assert "NapCat Watchdog" in status_unparse
 
 
 def test_configuration_schema_has_all_required_fields() -> None:
