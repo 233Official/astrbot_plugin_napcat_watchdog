@@ -164,7 +164,7 @@ class TestReleasePackage:
         for req in required:
             assert f"{prefix}{req}" in names, f"Missing required file: {prefix}{req}"
 
-    def test_core_and_docs_dirs(self, tmp_path: Path) -> None:
+    def test_runtime_dirs(self, tmp_path: Path) -> None:
         zip_path = _get_release_zip(tmp_path)
         prefix = f"{_METADATA_NAME}/"
 
@@ -178,6 +178,16 @@ class TestReleasePackage:
         doc_files = [n for n in names if n.startswith(f"{prefix}docs/")]
         assert len(doc_files) > 0, f"No docs/ files in archive:\n{names}"
         assert f"{prefix}docs/PRD.md" in names, "Missing docs/PRD.md"
+
+        assert f"{prefix}templates/notification_card.html" in names, (
+            "Missing runtime notification card template"
+        )
+        assert f"{prefix}templates/status_dashboard.html" in names, (
+            "Missing runtime status dashboard template"
+        )
+        assert not any("templates/preview/" in name for name in names), (
+            "Static template previews must not be included in the plugin package"
+        )
 
     def test_no_forbidden_content(self, tmp_path: Path) -> None:
         zip_path = _get_release_zip(tmp_path)

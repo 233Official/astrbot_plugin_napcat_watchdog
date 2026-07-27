@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: fit-content;
+      min-width: 0;
+      min-height: 0;
+      height: auto;
+      margin: 0;
+      padding: 0;
+      background: #eeeae4;
+    }
+
+    body {
+      display: block;
+      padding: 16px;
+      overflow: hidden;
+      color: #242321;
+      font-family: "Avenir Next", "SF Pro Display", "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .dashboard {
+      --service-accent: #239a82;
+      --service-dark: #126c5c;
+      --service-soft: #e9f7f3;
+      --service-line: #b8dfd5;
+      width: 780px;
+      max-width: 780px;
+      overflow: hidden;
+      border: 1px solid #d9d3cb;
+      border-radius: 24px;
+      background: #fbfaf8;
+      box-shadow: 0 20px 48px rgba(69, 57, 45, 0.13), 0 3px 9px rgba(69, 57, 45, 0.06);
+    }
+
+    .dashboard.stopped {
+      --service-accent: #dc5b4f;
+      --service-dark: #a93630;
+      --service-soft: #fff0ed;
+      --service-line: #f1c5bf;
+    }
+
+    .accent-line {
+      height: 6px;
+      background: var(--service-accent);
+    }
+
+    .dashboard-body {
+      padding: 24px 28px 20px;
+    }
+
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 28px;
+    }
+
+    .title {
+      margin: 0;
+      color: #24211e;
+      font-size: 34px;
+      font-weight: 790;
+      line-height: 1.12;
+      letter-spacing: -0.035em;
+    }
+
+    .updated-at {
+      margin: 8px 0 0;
+      color: #7c756d;
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1.4;
+    }
+
+    .service-badge {
+      display: inline-flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: 8px;
+      margin-top: 2px;
+      padding: 9px 13px;
+      border: 1px solid var(--service-line);
+      border-radius: 999px;
+      color: var(--service-dark);
+      background: var(--service-soft);
+      font-size: 14px;
+      font-weight: 820;
+      line-height: 1;
+    }
+
+    .service-badge:before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--service-accent);
+      box-shadow: 0 0 0 4px var(--service-soft);
+    }
+
+    .summary {
+      margin-top: 20px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      overflow: hidden;
+      border: 1px solid #dfdad3;
+      border-radius: 17px;
+      background: #ffffff;
+    }
+
+    .summary-item {
+      min-width: 0;
+      padding: 15px 16px 14px;
+    }
+
+    .summary-item + .summary-item {
+      border-left: 1px solid #e5e0d9;
+    }
+
+    .summary-value {
+      display: block;
+      color: #292622;
+      font-size: 27px;
+      font-weight: 820;
+      line-height: 1;
+      letter-spacing: -0.03em;
+    }
+
+    .summary-label {
+      display: block;
+      margin-top: 8px;
+      color: #746d65;
+      font-size: 12px;
+      font-weight: 780;
+      line-height: 1.25;
+    }
+
+    .health-strip {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-top: 10px;
+    }
+
+    .health-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border: 1px solid;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .health-chip strong {
+      font-size: 14px;
+      font-weight: 850;
+    }
+
+    .health-chip.online {
+      color: #126c5c;
+      border-color: #b8dfd5;
+      background: #e9f7f3;
+    }
+
+    .health-chip.pending {
+      color: #916312;
+      border-color: #ead39b;
+      background: #fff6de;
+    }
+
+    .health-chip.offline {
+      color: #a93630;
+      border-color: #f1c5bf;
+      background: #fff0ed;
+    }
+
+    .subscription-panel {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin-top: 16px;
+      padding: 13px 15px;
+      border: 1px solid #dfdad3;
+      border-radius: 15px;
+      background: #f4f1ed;
+    }
+
+    .subscription-copy {
+      min-width: 0;
+    }
+
+    .subscription-title {
+      color: #34302c;
+      font-size: 14px;
+      font-weight: 820;
+      line-height: 1.3;
+    }
+
+    .subscription-detail {
+      margin-left: 8px;
+      color: #756e66;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .group-badge {
+      flex: 0 0 auto;
+      padding: 6px 10px;
+      border: 1px solid #d8d1c9;
+      border-radius: 999px;
+      color: #6d665e;
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 12px;
+      font-weight: 780;
+      line-height: 1;
+    }
+
+    .group-badge.subscribed {
+      color: #126c5c;
+      border-color: #b8dfd5;
+      background: #e9f7f3;
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin-top: 20px;
+      margin-bottom: 10px;
+    }
+
+    .section-title {
+      margin: 0;
+      color: #393530;
+      font-size: 16px;
+      font-weight: 820;
+      line-height: 1.3;
+    }
+
+    .section-count {
+      color: #898178;
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .instance-list {
+      overflow: hidden;
+      border: 1px solid #dfdad3;
+      border-radius: 18px;
+      background: #ffffff;
+    }
+
+    .instance-row {
+      --row-accent: #dc5b4f;
+      --row-dark: #a93630;
+      --row-soft: #fff0ed;
+      --row-line: #f1c5bf;
+      display: grid;
+      grid-template-columns: 52px minmax(0, 1fr) minmax(260px, 1.1fr) auto;
+      gap: 14px;
+      align-items: center;
+      min-height: 78px;
+      padding: 12px 14px;
+    }
+
+    .instance-row + .instance-row {
+      border-top: 1px solid #e8e3dd;
+    }
+
+    .instance-row.online {
+      --row-accent: #239a82;
+      --row-dark: #126c5c;
+      --row-soft: #e9f7f3;
+      --row-line: #b8dfd5;
+    }
+
+    .instance-row.pending {
+      --row-accent: #d49a2f;
+      --row-dark: #916312;
+      --row-soft: #fff6de;
+      --row-line: #ead39b;
+    }
+
+    .avatar {
+      position: relative;
+      display: flex;
+      width: 52px;
+      height: 52px;
+      overflow: hidden;
+      align-items: center;
+      justify-content: center;
+      border: 2px solid #ffffff;
+      border-radius: 50%;
+      color: var(--row-dark);
+      background: var(--row-soft);
+      box-shadow: 0 3px 10px rgba(65, 54, 43, 0.12), 0 0 0 1px var(--row-line);
+      font-size: 19px;
+      font-weight: 850;
+      line-height: 1;
+    }
+
+    .avatar:after {
+      content: "";
+      position: absolute;
+      right: 2px;
+      bottom: 2px;
+      width: 9px;
+      height: 9px;
+      border: 2px solid #ffffff;
+      border-radius: 50%;
+      background: var(--row-accent);
+    }
+
+    .avatar img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .identity {
+      min-width: 0;
+    }
+
+    .identity-topline {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .nickname {
+      min-width: 0;
+      overflow: hidden;
+      margin: 0;
+      color: #2b2824;
+      font-size: 17px;
+      font-weight: 820;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .instance-label {
+      flex: 0 1 auto;
+      max-width: 120px;
+      overflow: hidden;
+      padding: 3px 7px;
+      border: 1px solid #dfd8d0;
+      border-radius: 999px;
+      color: #7d756c;
+      background: #f5f2ee;
+      font-size: 10px;
+      font-weight: 760;
+      line-height: 1.1;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .account-number {
+      display: block;
+      margin-top: 5px;
+      color: #756e66;
+      font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", "PingFang SC", monospace;
+      font-size: 13px;
+      font-weight: 730;
+      line-height: 1.2;
+      letter-spacing: 0.04em;
+    }
+
+    .meta-group {
+      display: grid;
+      grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .meta-item {
+      min-width: 0;
+    }
+
+    .meta-item + .meta-item {
+      padding-left: 12px;
+      border-left: 1px solid #e4dfd8;
+    }
+
+    .meta-label {
+      display: block;
+      margin-bottom: 4px;
+      color: #8a8279;
+      font-size: 11px;
+      font-weight: 780;
+      line-height: 1.15;
+    }
+
+    .meta-value {
+      display: block;
+      overflow-wrap: anywhere;
+      color: #49443e;
+      font-size: 13px;
+      font-weight: 740;
+      line-height: 1.25;
+    }
+
+    .row-status {
+      min-width: 70px;
+      padding: 7px 10px;
+      border: 1px solid var(--row-line);
+      border-radius: 999px;
+      color: var(--row-dark);
+      background: var(--row-soft);
+      font-size: 12px;
+      font-weight: 830;
+      line-height: 1;
+      text-align: center;
+    }
+
+    .empty-state {
+      padding: 28px 24px;
+      border: 1px dashed #d9d1c8;
+      border-radius: 18px;
+      color: #777068;
+      background: #f6f3ef;
+      text-align: center;
+    }
+
+    .empty-mark {
+      display: flex;
+      width: 48px;
+      height: 48px;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 12px;
+      border: 1px solid #d8d1c9;
+      border-radius: 16px;
+      color: #777068;
+      background: #ffffff;
+      font-size: 19px;
+      font-weight: 850;
+    }
+
+    .empty-title {
+      margin: 0;
+      color: #3f3a35;
+      font-size: 16px;
+      font-weight: 820;
+    }
+
+    .empty-copy {
+      margin: 7px 0 0;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      margin-top: 15px;
+      padding-top: 13px;
+      border-top: 1px solid #e5e0d9;
+      color: #918a81;
+      font-size: 12px;
+      font-weight: 650;
+      line-height: 1.3;
+    }
+
+    .footer strong {
+      color: #625c54;
+      font-weight: 800;
+    }
+  </style>
+</head>
+<body>
+  {% set service_is_running = service_running|default(false) %}
+  {% set instance_items = instances|default([], true) %}
+  {% set registered_value = registered_count|default(instance_items|length) %}
+  {% set group_state = current_group_subscribed|default(none) %}
+
+  <main class="dashboard {{ 'running' if service_is_running else 'stopped' }}">
+    <div class="accent-line"></div>
+    <div class="dashboard-body">
+      <header class="header">
+        <div>
+          <h1 class="title">NapCat 监控状态</h1>
+          <p class="updated-at">更新于 {{ updated_at|default('时间未知', true)|e }}</p>
+        </div>
+        <span class="service-badge">{{ '运行中' if service_is_running else '未运行' }}</span>
+      </header>
+
+      <section class="summary" aria-label="监控摘要">
+        <div class="summary-grid">
+          <div class="summary-item">
+            <span class="summary-value">{{ connection_count|default(0, true)|e }}</span>
+            <span class="summary-label">当前连接</span>
+          </div>
+          <div class="summary-item">
+            <span class="summary-value">{{ registered_value|e }}</span>
+            <span class="summary-label">注册实例</span>
+          </div>
+          <div class="summary-item">
+            <span class="summary-value">{{ subscription_count|default(0, true)|e }}</span>
+            <span class="summary-label">群订阅</span>
+          </div>
+          <div class="summary-item">
+            <span class="summary-value">{{ pending_delivery_count|default(0, true)|e }}</span>
+            <span class="summary-label">待投递</span>
+          </div>
+        </div>
+        <div class="health-strip" aria-label="实例状态统计">
+          <span class="health-chip online">在线 <strong>{{ online_count|default(0, true)|e }}</strong></span>
+          <span class="health-chip pending">待确认 <strong>{{ pending_count|default(0, true)|e }}</strong></span>
+          <span class="health-chip offline">离线 <strong>{{ offline_count|default(0, true)|e }}</strong></span>
+        </div>
+      </section>
+
+      <section class="subscription-panel" aria-label="订阅概况">
+        <div class="subscription-copy">
+          <span class="subscription-title">订阅概况</span>
+          <span class="subscription-detail">共 {{ subscription_count|default(0, true)|e }} 个群</span>
+        </div>
+        {% if group_state is sameas true %}
+        <span class="group-badge subscribed">当前群已订阅</span>
+        {% elif group_state is sameas false %}
+        <span class="group-badge">当前群未订阅</span>
+        {% else %}
+        <span class="group-badge">未提供当前群信息</span>
+        {% endif %}
+      </section>
+
+      <section aria-label="实例状态">
+        <div class="section-heading">
+          <h2 class="section-title">实例状态</h2>
+          <span class="section-count">共 {{ registered_value|e }} 个</span>
+        </div>
+
+        {% if instance_items %}
+        <div class="instance-list">
+          {% for instance in instance_items %}
+            {% set raw_status = instance.status|default('offline', true)|lower %}
+            {% if raw_status == 'online' %}
+              {% set row_tone = 'online' %}
+              {% set default_status_label = '在线' %}
+              {% set default_duration_label = '在线时长' %}
+            {% elif raw_status == 'pending_offline' %}
+              {% set row_tone = 'pending' %}
+              {% set default_status_label = '待确认' %}
+              {% set default_duration_label = '待确认时长' %}
+            {% else %}
+              {% set row_tone = 'offline' %}
+              {% set default_status_label = '离线' %}
+              {% set default_duration_label = '离线时长' %}
+            {% endif %}
+            {% set nickname_input = instance.nickname|default('', true)|string %}
+            {% set nickname_display = nickname_input if nickname_input else '未命名账号' %}
+            {% set avatar_initial = nickname_input[:1]|upper if nickname_input else 'Q' %}
+            {% set avatar_value = instance.avatar_data_uri|default('', true)|string %}
+            {% set avatar_probe = avatar_value[:32]|lower %}
+            {% set avatar_allowed = avatar_probe.startswith('data:image/png;base64,') or avatar_probe.startswith('data:image/jpeg;base64,') or avatar_probe.startswith('data:image/jpg;base64,') or avatar_probe.startswith('data:image/webp;base64,') %}
+            {% set qq_input = instance.masked_qq|default('', true)|string %}
+            {% if qq_input|length >= 6 %}
+              {% set qq_display = qq_input[:2] ~ '****' ~ qq_input[-2:] %}
+            {% elif qq_input|length >= 3 %}
+              {% set qq_display = qq_input[:1] ~ '***' ~ qq_input[-1:] %}
+            {% elif qq_input %}
+              {% set qq_display = '已隐藏' %}
+            {% else %}
+              {% set qq_display = '号码未提供' %}
+            {% endif %}
+
+          <article class="instance-row {{ row_tone }}">
+            <div class="avatar" aria-hidden="true">
+              {% if avatar_allowed %}
+              <img src="{{ avatar_value|e }}" alt="">
+              {% else %}
+              <span>{{ avatar_initial|e }}</span>
+              {% endif %}
+            </div>
+            <div class="identity">
+              <div class="identity-topline">
+                <h3 class="nickname">{{ nickname_display|e }}</h3>
+                {% if instance.instance_label is defined and instance.instance_label %}
+                <span class="instance-label">{{ instance.instance_label|e }}</span>
+                {% endif %}
+              </div>
+              <span class="account-number">{{ qq_display|e }}</span>
+            </div>
+            <div class="meta-group">
+              <div class="meta-item">
+                <span class="meta-label">最近心跳</span>
+                <span class="meta-value">{{ instance.last_heartbeat_text|default('暂无记录', true)|e }}</span>
+              </div>
+              <div class="meta-item">
+                <span class="meta-label">{{ instance.duration_label|default(default_duration_label, true)|e }}</span>
+                <span class="meta-value">{{ instance.status_duration_text|default('不到1分钟', true)|e }}</span>
+              </div>
+            </div>
+            <span class="row-status">{{ instance.status_label|default(default_status_label, true)|e }}</span>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+          <div class="empty-mark">Q</div>
+          <p class="empty-title">尚未注册实例</p>
+          <p class="empty-copy">注册后将在这里显示连接与心跳状态。</p>
+        </div>
+        {% endif %}
+      </section>
+
+      <footer class="footer">
+        <strong>NapCat Watchdog</strong>
+        <span>仅展示脱敏账号信息</span>
+      </footer>
+    </div>
+  </main>
+</body>
+</html>

@@ -18,6 +18,8 @@ disconnect notification, and generation-based stale event isolation.
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import json
 import logging
 import secrets
@@ -51,6 +53,9 @@ machine, allowing the receiver to filter stale events.
 DisconnectCallback = Callable[[int, int], Awaitable[None]]
 """Async disconnect callback ``fn(self_id, generation)``."""
 
+ProfileCallback = Callable[[int, int, str], Awaitable[None]]
+"""Async callback ``fn(self_id, generation, nickname)``."""
+
 CancelCapacityHandler = Callable[[int], Awaitable[None]]
 """Async capacity-rollback callback ``fn(self_id)``.
 
@@ -74,6 +79,7 @@ class WatchdogWSServer:
         port: int = 19090,
         path: str = "/napcat-watchdog/ws",
         access_token: str = "",
+        profile_timeout: float = 3.0,
     ) -> None:
         if not access_token:
             raise ValueError("access_token must not be empty")
@@ -81,6 +87,7 @@ class WatchdogWSServer:
         self._port = port
         self._path = path
         self._access_token = access_token
+        self._profile_timeout = max(0.05, min(float(profile_timeout), 10.0))
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -94,6 +101,15 @@ class WatchdogWSServer:
         self._admission_handler: AdmissionHandler | None = None
         self._event_callback: EventCallback | None = None
         self._disconnect_callback: DisconnectCallback | None = None
+        self._profile_callback: ProfileCallback | None = None
+
+        # Keyed by authenticated connection generation and echo so delayed
+        # responses from a replaced connection cannot resolve a new request.
+        self._pending_actions: dict[
+            tuple[int, int, str], asyncio.Future[dict[str, Any]]
+        ] = {}
+        self._profile_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self._echo_counter = itertools.count(1)
 
     # ---- Public API ----
 
@@ -154,6 +170,10 @@ class WatchdogWSServer:
         authoritative value from the state machine at admission time.
         """
         self._disconnect_callback = callback
+
+    def set_profile_callback(self, callback: ProfileCallback | None) -> None:
+        """Register a callback for validated ``get_login_info`` nicknames."""
+        self._profile_callback = callback
 
     async def update_access_token(self, new_token: str) -> None:
         """Replace the access token and close all existing connections.
@@ -231,8 +251,12 @@ class WatchdogWSServer:
 
     async def _close_all(self, code: int = 1001, message: bytes = b"") -> None:
         """Close every tracked WebSocket connection."""
+        entries = list(self._connections.items())
         ws_list = [ws for ws, _ in self._connections.values()]
         self._connections.clear()
+
+        for self_id, (_, generation) in entries:
+            self._cancel_connection_actions(self_id, generation)
 
         for ws in ws_list:
             if not ws.closed:
@@ -321,6 +345,7 @@ class WatchdogWSServer:
         # Then close old connection (if any)
         if old_entry is not None:
             old_ws, old_gen = old_entry
+            self._cancel_connection_actions(self_id, old_gen)
             if not old_ws.closed:
                 try:
                     await old_ws.close(code=1001, message=b"Replaced by new connection")
@@ -334,6 +359,11 @@ class WatchdogWSServer:
             len(self._connections),
         )
 
+        # Profile enrichment must never block admission or heartbeat
+        # processing.  The request is sent after the connection is admitted.
+        if self._profile_callback is not None:
+            self._start_profile_lookup(ws, self_id, generation)
+
         # ---- Receive loop ----
         try:
             async for msg in ws:
@@ -344,6 +374,7 @@ class WatchdogWSServer:
         except (ConnectionResetError, aiohttp.WebSocketError):
             pass
         finally:
+            self._cancel_connection_actions(self_id, generation)
             # Only remove if this connection is still the current one
             current = self._connections.get(self_id)
             if current is not None and current[0] is ws:
@@ -384,6 +415,11 @@ class WatchdogWSServer:
         if not isinstance(data, dict):
             return
 
+        # Resolve action responses before heartbeat validation.  This keeps
+        # ``echo``-correlated OneBot responses from being mistaken for events.
+        if self._resolve_action_response(self_id, generation, data):
+            return
+
         # ---- Strict heartbeat parsing ----
         # We only dispatch valid heartbeats; other events are discarded.
         if not _is_valid_heartbeat(data, self_id):
@@ -399,6 +435,136 @@ class WatchdogWSServer:
                     self_id,
                     generation,
                 )
+
+    def _start_profile_lookup(
+        self,
+        ws: web.WebSocketResponse,
+        self_id: int,
+        generation: int,
+    ) -> None:
+        key = (self_id, generation)
+        previous = self._profile_tasks.pop(key, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        task = asyncio.create_task(self._request_login_info(ws, self_id, generation))
+        self._profile_tasks[key] = task
+        task.add_done_callback(self._observe_profile_task)
+
+    async def _request_login_info(
+        self,
+        ws: web.WebSocketResponse,
+        self_id: int,
+        generation: int,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        echo = f"napcat-watchdog:login-info:{next(self._echo_counter)}"
+        key = (self_id, generation, echo)
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_actions[key] = future
+        try:
+            if ws.closed:
+                return
+            await ws.send_json({"action": "get_login_info", "params": {}, "echo": echo})
+            response = await asyncio.wait_for(future, timeout=self._profile_timeout)
+            nickname = _validated_login_nickname(response, self_id)
+            if nickname is None:
+                logger.warning(
+                    "NapCat login profile response invalid self_id=%s generation=%s",
+                    self_id,
+                    generation,
+                )
+                return
+            callback = self._profile_callback
+            if callback is not None:
+                await callback(self_id, generation, nickname)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "NapCat login profile request timed out self_id=%s generation=%s",
+                self_id,
+                generation,
+            )
+        except Exception:
+            logger.warning(
+                "NapCat login profile request failed self_id=%s generation=%s type=%s",
+                self_id,
+                generation,
+                "transport_or_callback_error",
+            )
+        finally:
+            if self._pending_actions.get(key) is future:
+                self._pending_actions.pop(key, None)
+            task = asyncio.current_task()
+            if (
+                task is not None
+                and self._profile_tasks.get((self_id, generation)) is task
+            ):
+                self._profile_tasks.pop((self_id, generation), None)
+
+    def _resolve_action_response(
+        self,
+        self_id: int,
+        generation: int,
+        data: dict[str, Any],
+    ) -> bool:
+        echo = data.get("echo")
+        if echo is None:
+            return False
+        key = (self_id, generation, str(echo))
+        future = self._pending_actions.get(key)
+        if future is None:
+            return False
+        if not future.done():
+            future.set_result(data)
+        return True
+
+    def _cancel_connection_actions(self, self_id: int, generation: int) -> None:
+        for key, future in list(self._pending_actions.items()):
+            if key[:2] == (self_id, generation):
+                if not future.done():
+                    future.cancel()
+                self._pending_actions.pop(key, None)
+        task = self._profile_tasks.pop((self_id, generation), None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    @staticmethod
+    def _observe_profile_task(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("NapCat login profile background task failed")
+
+
+def _validated_login_nickname(
+    response: dict[str, Any], expected_self_id: int
+) -> str | None:
+    """Validate a OneBot ``get_login_info`` response without logging payloads."""
+    if response.get("status") != "ok":
+        return None
+    retcode = response.get("retcode")
+    if isinstance(retcode, bool) or not isinstance(retcode, int) or retcode != 0:
+        return None
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return None
+    user_id = data.get("user_id")
+    if isinstance(user_id, bool):
+        return None
+    if isinstance(user_id, str) and user_id.isdigit():
+        user_id = int(user_id)
+    if not isinstance(user_id, int) or user_id != expected_self_id:
+        return None
+    nickname = data.get("nickname")
+    if not isinstance(nickname, str):
+        return None
+    nickname = "".join(
+        char for char in nickname.strip() if ord(char) >= 32 and ord(char) != 127
+    )
+    return nickname[:64] or None
 
 
 # ---- Strict heartbeat validation ----

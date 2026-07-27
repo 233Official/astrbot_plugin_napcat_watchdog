@@ -36,6 +36,7 @@ OPTIONAL_ROOT_FILES = [
 PACKAGE_DIRS = [
     "core",
     "docs",
+    "templates",
 ]
 
 EXCLUDE_DIRS = {
@@ -49,6 +50,7 @@ EXCLUDE_DIRS = {
     "scripts",
     ".pytest_cache",
     ".ruff_cache",
+    "preview",
 }
 
 

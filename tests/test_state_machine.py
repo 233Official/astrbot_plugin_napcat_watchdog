@@ -145,7 +145,7 @@ class TestRegistrationLimit:
 
 
 class TestFirstConnection:
-    """First-ever connection → ONLINE + FIRST_ONLINE callback."""
+    """First-ever connection is silent until a valid online heartbeat."""
 
     async def test_first_connect_sets_online(self) -> None:
         mono = FakeMono()
@@ -159,12 +159,12 @@ class TestFirstConnection:
         assert sm.registered_count == 1
         assert sm.online_count == 1
 
-    async def test_first_connect_returns_first_online_kind(self) -> None:
+    async def test_first_connect_waits_for_first_online_heartbeat(self) -> None:
         sm = make_sm()
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
-        assert kind == TransitionKind.FIRST_ONLINE
+        generation = sm.confirm_connection(1)
+        assert sm.get_confirm_transition(1) is None
+        assert sm.on_heartbeat(1, generation, True) == TransitionKind.FIRST_ONLINE
 
     async def test_first_connect_fires_event_after_manual_dispatch(self) -> None:
         sm = make_sm()
@@ -175,9 +175,10 @@ class TestFirstConnection:
 
         sm.set_transition_callback(cb)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
-        assert kind is not None
+        generation = sm.confirm_connection(1)
+        assert sm.get_confirm_transition(1) is None
+        kind = sm.on_heartbeat(1, generation, True)
+        assert kind == TransitionKind.FIRST_ONLINE
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)
         await asyncio.sleep(0)
         assert len(transitions) == 1
@@ -222,9 +223,9 @@ class TestConnectionReplacement:
     async def test_replacement_no_transition_kind(self) -> None:
         sm = make_sm()
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
-        assert kind == TransitionKind.FIRST_ONLINE
+        generation = sm.confirm_connection(1)
+        assert sm.get_confirm_transition(1) is None
+        assert sm.on_heartbeat(1, generation, True) == TransitionKind.FIRST_ONLINE
 
         # Replacement — should return None
         sm.confirm_connection(1)
@@ -257,6 +258,7 @@ class TestDisconnect:
         sm = make_sm(mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(5.0)
         sm.on_disconnect(1, g)
         # Confirmed status is still ONLINE
@@ -283,6 +285,7 @@ class TestDisconnect:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)  # exceed 10s timeout
         sm.check_timeouts()
@@ -341,6 +344,7 @@ class TestHeartbeat:
         sm = make_sm(mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(5.0)
         sm.on_heartbeat(1, g, False)
         assert sm.online_count == 0
@@ -364,6 +368,7 @@ class TestHeartbeat:
         sm = make_sm(mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        assert sm.on_heartbeat(1, g, True) == TransitionKind.FIRST_ONLINE
         mono.advance(5.0)
         sm.on_heartbeat(1, g, False)  # signal
         assert sm.pending_offline_count == 1
@@ -378,6 +383,7 @@ class TestHeartbeat:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_heartbeat(1, g, False)  # signal
         mono.advance(15.0)  # exceed 10s timeout
         sm.check_timeouts()
@@ -409,6 +415,7 @@ class TestHeartbeat:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(5.0)
         sm.on_heartbeat(1, g, False)  # signal at mono=5
         mono.advance(3.0)
@@ -435,6 +442,7 @@ class TestPendingTimeout:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         assert sm.pending_offline_count == 1
         mono.advance(15.0)  # exceed 10s timeout
@@ -448,6 +456,7 @@ class TestPendingTimeout:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         transitions: list[tuple[int, QQStatus, TransitionKind]] = []
 
         async def cb(sid: int, status: QQStatus, kind: TransitionKind) -> None:
@@ -470,8 +479,10 @@ class TestPendingTimeout:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g1 = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g1, True)
         await sm.try_reserve(2)
         g2 = sm.confirm_connection(2)
+        sm.on_heartbeat(2, g2, True)
         sm.on_disconnect(1, g1)
         sm.on_disconnect(2, g2)
         assert sm.pending_offline_count == 2
@@ -487,6 +498,7 @@ class TestPendingTimeout:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_heartbeat(1, g, False)  # heartbeat_false signal
         assert sm.pending_offline_count == 1
         mono.advance(5.0)  # before timeout
@@ -503,6 +515,7 @@ class TestPendingTimeout:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(2.0)
         sm.on_disconnect(1, g)  # disconnect at mono=2
         mono.advance(3.0)
@@ -518,6 +531,7 @@ class TestPendingTimeout:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(2.0)
         sm.on_disconnect(1, g)
         assert sm.pending_offline_count == 1
@@ -541,6 +555,7 @@ class TestOfflineRecovery:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
         sm.check_timeouts()
@@ -552,8 +567,10 @@ class TestOfflineRecovery:
             transitions.append((sid, status, kind))
 
         sm.set_transition_callback(cb)
-        sm.confirm_connection(1)
+        g = sm.confirm_connection(1)
         kind = sm.get_confirm_transition(1)
+        assert kind is None
+        kind = sm.on_heartbeat(1, g, True)
         assert kind == TransitionKind.RECOVERED
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)
         await asyncio.sleep(0)
@@ -568,6 +585,7 @@ class TestOfflineRecovery:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_heartbeat(1, g, False)
         mono.advance(15.0)
         sm.check_timeouts()
@@ -611,6 +629,7 @@ class TestEarliestDeadline:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(2.0)
         sm.on_disconnect(1, g)  # earliest = mono=2
         mono.advance(5.0)
@@ -624,6 +643,7 @@ class TestEarliestDeadline:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(2.0)
         sm.on_heartbeat(1, g, False)  # earliest = mono=2
         mono.advance(3.0)
@@ -645,7 +665,8 @@ class TestHeartbeatTimeoutSweep:
         mono = FakeMono()
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
+        g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(15.0)
         sm.sweep_heartbeat_timeouts()
         assert sm.pending_offline_count == 1
@@ -657,7 +678,7 @@ class TestHeartbeatTimeoutSweep:
         sm.confirm_connection(1)
         mono.advance(15.0)
         sm.sweep_heartbeat_timeouts()
-        assert sm.pending_offline_count == 1
+        assert sm.pending_offline_count == 0
 
     async def test_online_qq_not_affected_when_recent_heartbeat(self) -> None:
         mono = FakeMono()
@@ -675,7 +696,8 @@ class TestHeartbeatTimeoutSweep:
         mono = FakeMono()
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
+        g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(9.999)  # still within timeout
         sm.sweep_heartbeat_timeouts()
         assert sm.online_count == 1
@@ -687,7 +709,8 @@ class TestHeartbeatTimeoutSweep:
         wall = FakeWall()
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)  # baseline = 0
+        g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)  # baseline = 0
         mono.advance(10.0)  # exactly at timeout boundary
         sm.sweep_heartbeat_timeouts()
         assert sm.pending_offline_count == 1
@@ -702,7 +725,8 @@ class TestHeartbeatTimeoutSweep:
         mono = FakeMono()
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
+        g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(15.0)
         sm.sweep_heartbeat_timeouts()
         assert sm.pending_offline_count == 1
@@ -881,6 +905,7 @@ class TestSnapshotRoundTrip:
         sm = make_sm(mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(5.0)
         sm.on_disconnect(1, g)
         snap = sm.get_all_views()
@@ -891,6 +916,7 @@ class TestSnapshotRoundTrip:
         sm = make_sm(mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         mono.advance(5.0)
         sm.on_disconnect(1, g)
         mono.advance(2.0)
@@ -917,6 +943,8 @@ class TestSnapshotRoundTrip:
             "registered_at",
             "last_status_change",
             "offline_since",
+            "offline_episode_id",
+            "online_confirmed",
         }
         assert keys == allowed
 
@@ -938,8 +966,8 @@ class TestTransitionCallback:
 
         sm.set_transition_callback(cb)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
+        g = sm.confirm_connection(1)
+        kind = sm.on_heartbeat(1, g, True)
         assert kind == TransitionKind.FIRST_ONLINE
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)
         await asyncio.sleep(0)
@@ -957,6 +985,7 @@ class TestTransitionCallback:
         sm.set_transition_callback(cb)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
         transitions = sm.check_timeouts()
@@ -971,6 +1000,7 @@ class TestTransitionCallback:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
         sm.check_timeouts()
@@ -982,8 +1012,10 @@ class TestTransitionCallback:
             kinds.append(kind)
 
         sm.set_transition_callback(cb)
-        sm.confirm_connection(1)
+        g = sm.confirm_connection(1)
         kind = sm.get_confirm_transition(1)
+        assert kind is None
+        kind = sm.on_heartbeat(1, g, True)
         assert kind == TransitionKind.RECOVERED
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)
         await asyncio.sleep(0)
@@ -1013,9 +1045,9 @@ class TestTransitionCallback:
 
         sm.set_transition_callback(_broken)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
-        assert kind is not None
+        g = sm.confirm_connection(1)
+        kind = sm.on_heartbeat(1, g, True)
+        assert kind == TransitionKind.FIRST_ONLINE
         # fire_transition_event catches callback exceptions
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)  # Should not raise
         await asyncio.sleep(0)
@@ -1045,6 +1077,7 @@ class TestUndoConfirm:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
         sm.check_timeouts()
@@ -1052,7 +1085,7 @@ class TestUndoConfirm:
 
         # Try to reconnect but fail
         sm.confirm_connection(1)
-        assert sm.online_count == 1
+        assert sm.offline_count == 1
         sm.undo_confirm(1)
         assert sm.offline_count == 1  # restored to OFFLINE
         # offline_since should be set
@@ -1133,6 +1166,7 @@ class TestEdgeCases:
         sm = make_sm(timeout=10.0, mono=mono)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         sm.on_disconnect(1, g)
         sm.on_disconnect(1, g)
@@ -1152,9 +1186,11 @@ class TestEdgeCases:
         sm = make_sm(mono=mono)
         # One QQ online, one pending
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
+        g1 = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g1, True)
         await sm.try_reserve(2)
         g2 = sm.confirm_connection(2)
+        sm.on_heartbeat(2, g2, True)
         mono.advance(5.0)
         sm.on_disconnect(2, g2)
         assert sm.online_count == 1
@@ -1247,17 +1283,18 @@ class TestRollbackSemantics:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
         sm.check_timeouts()
         assert sm.offline_count == 1
 
-        # Attempt recovery
-        sm.confirm_connection(1)
-        assert sm.online_count == 1
+        # Attempt recovery via a valid heartbeat
+        kind = sm.on_heartbeat(1, g, True)
+        assert kind == TransitionKind.RECOVERED
 
         # Save failure — undo
-        sm.undo_confirm(1)
+        sm.rollback_heartbeat_recovery(1)
         assert sm.offline_count == 1, "Must be restored to OFFLINE"
         assert sm.online_count == 0
         assert sm.registered_count == 1
@@ -1269,8 +1306,10 @@ class TestRollbackSemantics:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g1 = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g1, True)
         await sm.try_reserve(2)
         g2 = sm.confirm_connection(2)
+        sm.on_heartbeat(2, g2, True)
         sm.on_disconnect(1, g1)
         sm.on_disconnect(2, g2)
         mono.advance(15.0)
@@ -1296,6 +1335,7 @@ class TestRollbackSemantics:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
 
@@ -1326,6 +1366,7 @@ class TestRollbackSemantics:
         sm = make_sm(timeout=10.0, mono=mono, wall=wall)
         await sm.try_reserve(1)
         g = sm.confirm_connection(1)
+        sm.on_heartbeat(1, g, True)
         sm.on_disconnect(1, g)
         mono.advance(15.0)
         sm.check_timeouts()
@@ -1350,7 +1391,7 @@ class TestRollbackSemantics:
         sm = make_sm()
         await sm.try_reserve(1)
         sm.confirm_connection(1)
-        assert sm.get_confirm_transition(1) == TransitionKind.FIRST_ONLINE
+        assert sm.get_confirm_transition(1) is None
 
         # Replacement — no transition
         sm.confirm_connection(1)
@@ -1362,12 +1403,14 @@ class TestRollbackSemantics:
         sm2 = make_sm(timeout=5.0, mono=mono, wall=wall)
         await sm2.try_reserve(2)
         g = sm2.confirm_connection(2)
+        sm2.on_heartbeat(2, g, True)
         sm2.on_disconnect(2, g)
         mono.advance(10.0)
         sm2.check_timeouts()
         assert sm2.offline_count == 1
-        sm2.confirm_connection(2)
-        assert sm2.get_confirm_transition(2) == TransitionKind.RECOVERED
+        g2 = sm2.confirm_connection(2)
+        assert sm2.get_confirm_transition(2) is None
+        assert sm2.on_heartbeat(2, g2, True) == TransitionKind.RECOVERED
 
     async def test_on_heartbeat_returns_none_when_no_recovery(self) -> None:
         """on_heartbeat returns None for normal keep-alive."""
@@ -1376,6 +1419,10 @@ class TestRollbackSemantics:
         g = sm.confirm_connection(1)
 
         # Normal heartbeat, ONLINE→ONLINE
+        result = sm.on_heartbeat(1, g, True)
+        assert result == TransitionKind.FIRST_ONLINE
+
+        # Later heartbeat, ONLINE→ONLINE
         result = sm.on_heartbeat(1, g, True)
         assert result is None
 
@@ -1408,8 +1455,8 @@ class TestEventOrdering:
 
         sm.set_transition_callback(cb)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
+        g = sm.confirm_connection(1)
+        kind = sm.on_heartbeat(1, g, True)
         assert kind == TransitionKind.FIRST_ONLINE
 
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)
@@ -1432,8 +1479,8 @@ class TestEventOrdering:
 
         sm.set_transition_callback(cb)
         await sm.try_reserve(1)
-        sm.confirm_connection(1)
-        kind = sm.get_confirm_transition(1)
+        g = sm.confirm_connection(1)
+        kind = sm.on_heartbeat(1, g, True)
         assert kind == TransitionKind.FIRST_ONLINE
         sm.fire_transition_event(1, QQStatus.ONLINE, kind)
         await asyncio.sleep(0)
@@ -1498,6 +1545,72 @@ class TestShutdownRollback:
         sm.force_offline(1)
         await asyncio.sleep(0)
         assert TransitionKind.SHUTDOWN in kinds
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat-confirmed notification transitions and durable episodes
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatConfirmedEpisodes:
+    async def test_admission_is_silent_until_first_valid_heartbeat(self) -> None:
+        sm = make_sm()
+        await sm.try_reserve(1)
+        generation = sm.confirm_connection(1)
+
+        assert sm._states[1].online_confirmed is False
+        assert sm.get_confirm_transition(1) is None
+
+        assert sm.on_heartbeat(1, generation, True) == TransitionKind.FIRST_ONLINE
+        assert sm._states[1].online_confirmed is True
+        assert sm.on_heartbeat(1, generation, True) is None
+
+    async def test_unconfirmed_account_cannot_start_offline_episode(self) -> None:
+        mono = FakeMono()
+        sm = make_sm(timeout=10.0, mono=mono)
+        await sm.try_reserve(1)
+        generation = sm.confirm_connection(1)
+        sm.on_disconnect(1, generation)
+        sm.on_heartbeat(1, generation, False)
+        mono.advance(100.0)
+        sm.sweep_heartbeat_timeouts()
+        assert sm.check_timeouts() == []
+        assert sm.offline_count == 0
+        assert sm.pending_offline_count == 0
+        assert sm._states[1].offline_episode_id == 0
+
+    async def test_timeout_increments_episode_and_rollback_restores_it(self) -> None:
+        mono = FakeMono()
+        sm = make_sm(timeout=10.0, mono=mono)
+        await sm.try_reserve(1)
+        generation = sm.confirm_connection(1)
+        sm.on_heartbeat(1, generation, True)
+        sm.on_disconnect(1, generation)
+        mono.advance(10.0)
+
+        transitions = sm.check_timeouts()
+        assert transitions == [(1, TransitionKind.OFFLINE_TIMEOUT)]
+        assert sm.get_snapshot()["1"]["offline_episode_id"] == 1
+        sm.rollback_timeout(1)
+        assert sm.get_snapshot()["1"]["offline_episode_id"] == 0
+
+    async def test_recovery_requires_current_generation_online_heartbeat(self) -> None:
+        mono = FakeMono()
+        sm = make_sm(timeout=10.0, mono=mono)
+        await sm.try_reserve(1)
+        generation = sm.confirm_connection(1)
+        sm.on_heartbeat(1, generation, True)
+        sm.on_disconnect(1, generation)
+        mono.advance(10.0)
+        sm.check_timeouts()
+
+        reconnect_generation = sm.confirm_connection(1)
+        assert sm.offline_count == 1
+        assert sm.get_confirm_transition(1) is None
+        assert sm.on_heartbeat(1, generation, True) is None
+        assert (
+            sm.on_heartbeat(1, reconnect_generation, True) == TransitionKind.RECOVERED
+        )
 
 
 # ---------------------------------------------------------------------------

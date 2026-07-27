@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -169,6 +170,8 @@ class _QQData:
     registered_at: float  # UTC epoch seconds
     last_status_change: float  # UTC epoch seconds
     offline_since: float | None = None  # UTC epoch seconds
+    offline_episode_id: int = 0  # durable sequence; increments on timeout only
+    online_confirmed: bool = False  # first valid online heartbeat has arrived
 
     # Runtime-only — never persisted
     connection_established_mono: float | None = None
@@ -184,6 +187,18 @@ class _QQData:
 
 
 @dataclass
+class _TransitionContext:
+    """Runtime-only wall-clock details retained until callback consumption."""
+
+    kind: TransitionKind
+    event_time: float | None
+    offline_since: float | None = None
+    online_since: float | None = None
+    episode_id: int | None = None
+    dispatched: bool = False
+
+
+@dataclass
 class _PreTimeout:
     """Saved state before a timeout transition, used for rollback."""
 
@@ -192,6 +207,8 @@ class _PreTimeout:
     offline_since: float | None
     signals: _Signals
     had_timer: bool
+    offline_episode_id: int
+    transition_context: _TransitionContext | None = None
 
 
 @dataclass
@@ -202,6 +219,20 @@ class _PreHbRecovery:
     last_status_change: float
     offline_since: float | None
     signals: _Signals
+    online_confirmed: bool
+    transition_context: _TransitionContext | None = None
+
+
+@dataclass
+class _PreConfirm:
+    """Saved state before connection admission mutates an existing QQ."""
+
+    confirmed_status: QQStatus
+    last_status_change: float
+    offline_since: float | None
+    signals: _Signals
+    online_confirmed: bool
+    offline_episode_id: int
 
 
 # ---------------------------------------------------------------------------
@@ -218,14 +249,15 @@ class StateMachine:
 
     **Transition rules**::
 
-        (nonexistent) → confirm_connection  → ONLINE  ✉ FIRST_ONLINE
+        (nonexistent) → confirm_connection  → ONLINE (silent, awaits heartbeat)
+        ONLINE        → on_heartbeat(true)  → ONLINE  ✉ FIRST_ONLINE (first)
         ONLINE        → on_disconnect       → ONLINE  (sets disconnect signal)
         ONLINE        → on_heartbeat(false))→ ONLINE  (sets heartbeat_false signal)
         ONLINE        → sweep timeout       → ONLINE  (sets heartbeat_miss signal)
         ONLINE+PENDING→ on_heartbeat(true)  → ONLINE  (clears hb signals)
         ONLINE+PENDING→ confirm_connection  → ONLINE  (silent, clears signals)
         OFFLINE+PENDING→ deadline reached   → OFFLINE ✉ OFFLINE_TIMEOUT
-        OFFLINE       → confirm_connection  → ONLINE  ✉ RECOVERED
+        OFFLINE       → confirm_connection  → OFFLINE (silent, awaits heartbeat)
         OFFLINE       → on_heartbeat(true)  → ONLINE  ✉ RECOVERED
 
     ``✉`` marks transitions for which the coordinator **must** persist
@@ -265,12 +297,20 @@ class StateMachine:
         # --- Pre-transition state for rollback ---
         # confirm_connection: old status before potential transition
         self._confirm_old_status: dict[int, QQStatus] = {}
+        # Existing state needed to undo a failed admission persistence.
+        self._pre_confirm: dict[int, _PreConfirm] = {}
         # Track brand-new confirmations (distinct from loaded-from-snapshot)
         self._new_confirm_ids: set[int] = set()
         # check_timeouts: pre-transition snapshot
         self._pre_timeout: dict[int, _PreTimeout] = {}
         # on_heartbeat recovery: pre-transition snapshot
         self._pre_hb_recovery: dict[int, _PreHbRecovery] = {}
+        # Runtime-only transition context retained until the callback reads it.
+        # The state snapshot intentionally remains unchanged: timeout context
+        # captures the preceding online ``last_status_change`` before it is
+        # overwritten, while recovery context captures the preceding
+        # ``offline_since`` before it is cleared.
+        self._transition_contexts: dict[int, list[_TransitionContext]] = {}
 
     # ---- Public properties ----
 
@@ -356,14 +396,18 @@ class StateMachine:
         responsible for persisting and then calling
         :meth:`fire_transition_event`.
 
-        If the QQ was previously ``OFFLINE`` or is brand-new, the caller
-        should:
+        If the QQ is brand-new, the caller should persist the registration but
+        must not fire a notification transition.  A valid online heartbeat
+        later produces ``FIRST_ONLINE``.  If the QQ was previously
+        ``OFFLINE``, admission leaves it confirmed offline until that
+        heartbeat produces ``RECOVERED``.
 
-        1. Call :meth:`get_confirm_transition` to check if a transition
-           occurred.
+        For heartbeat transitions, the caller should:
+
+        1. Call :meth:`on_heartbeat` with the validated heartbeat.
         2. Persist snapshot.
         3. On success, call :meth:`fire_transition_event`.
-        4. On failure, call :meth:`undo_confirm`.
+        4. On failure, call :meth:`rollback_heartbeat_recovery`.
         """
         self._reservations.discard(self_id)
         now_utc = self._wall()
@@ -394,6 +438,15 @@ class StateMachine:
         state.last_heartbeat_mono = 0.0  # reset heartbeat baseline
         old_status = state.confirmed_status
 
+        self._pre_confirm[self_id] = _PreConfirm(
+            confirmed_status=state.confirmed_status,
+            last_status_change=state.last_status_change,
+            offline_since=state.offline_since,
+            signals=copy.deepcopy(state.signals),
+            online_confirmed=state.online_confirmed,
+            offline_episode_id=state.offline_episode_id,
+        )
+
         # Clear disconnect and grace signals (new connection resolves these)
         state.signals.clear_disconnect()
         state.signals.clear_grace()
@@ -403,10 +456,10 @@ class StateMachine:
         self._cancel_timer(state)
 
         if old_status == QQStatus.OFFLINE:
-            # Transition: OFFLINE → ONLINE (recovery)
-            state.confirmed_status = QQStatus.ONLINE
-            state.last_status_change = now_utc
-            state.offline_since = None
+            # Admission alone is not a recovery.  Keep the confirmed status
+            # OFFLINE until a current-generation, validated online heartbeat
+            # arrives.  This prevents reconnect churn from producing online
+            # notifications and preserves the offline episode duration.
             state.signals.clear_all()
         elif self._has_pending_signals(state):
             # Grace-period/signal recovery — silent, no callback
@@ -418,24 +471,11 @@ class StateMachine:
     def get_confirm_transition(self, self_id: int) -> TransitionKind | None:
         """Return the transition kind from the last :meth:`confirm_connection`.
 
-        Returns ``None`` for ONLINE replacement (no callback needed).
-        The coordinator should call this after a successful persist to
-        decide whether to fire a transition event.
+        Admission is never a notification transition.  This method remains
+        as a compatibility hook for the coordinator and therefore always
+        returns ``None``; ``FIRST_ONLINE`` and ``RECOVERED`` are produced by
+        a current-generation valid online heartbeat instead.
         """
-        old = self._confirm_old_status.get(self_id)
-        if old is None:
-            return None
-        state = self._states.get(self_id)
-        if state is None:
-            return None
-
-        # Brand-new QQ (never persisted before)
-        if self_id in self._new_confirm_ids:
-            return TransitionKind.FIRST_ONLINE
-        # OFFLINE → ONLINE recovery
-        if old == QQStatus.OFFLINE and state.confirmed_status == QQStatus.ONLINE:
-            return TransitionKind.RECOVERED
-        # ONLINE replacement — no transition
         return None
 
     def _get_confirm_new_status(self, self_id: int) -> QQStatus | None:
@@ -455,6 +495,7 @@ class StateMachine:
         """
         old_status = self._confirm_old_status.pop(self_id, None)
         self._new_confirm_ids.discard(self_id)
+        pre = self._pre_confirm.pop(self_id, None)
         state = self._states.get(self_id)
         if state is None:
             return
@@ -467,11 +508,19 @@ class StateMachine:
             state.generation -= 1
             state.connection_established_mono = None
             state.last_heartbeat_mono = 0.0
-            state.signals.clear_all()
-            if old_status is not None:
-                state.confirmed_status = old_status
-                if old_status == QQStatus.OFFLINE and state.offline_since is None:
-                    state.offline_since = self._wall()
+            if pre is not None:
+                state.confirmed_status = pre.confirmed_status
+                state.last_status_change = pre.last_status_change
+                state.offline_since = pre.offline_since
+                state.signals = pre.signals
+                state.online_confirmed = pre.online_confirmed
+                state.offline_episode_id = pre.offline_episode_id
+            else:
+                state.signals.clear_all()
+                if old_status is not None:
+                    state.confirmed_status = old_status
+                    if old_status == QQStatus.OFFLINE and state.offline_since is None:
+                        state.offline_since = self._wall()
 
     def on_disconnect(self, self_id: int, generation: int) -> None:
         """Handle WebSocket disconnection.
@@ -483,6 +532,10 @@ class StateMachine:
         if state is None or state.generation != generation:
             return
         if state.confirmed_status != QQStatus.ONLINE:
+            return
+        if not state.online_confirmed:
+            # Admission is not proof of a live NapCat instance.  Do not start
+            # an offline episode until a valid online heartbeat confirms it.
             return
 
         if state.signals.disconnect_mono is None:
@@ -504,8 +557,9 @@ class StateMachine:
         matches) should reach this method.
 
         Returns a :class:`TransitionKind` if a transition occurred
-        (``RECOVERED``), or ``None``.  The coordinator must persist and
-        then call :meth:`fire_transition_event` if a transition happened.
+        (``FIRST_ONLINE`` or ``RECOVERED``), or ``None``.  The coordinator
+        must persist and then call :meth:`fire_transition_event` if a
+        transition happened.
         On persist failure, call :meth:`rollback_heartbeat_recovery`.
         """
         state = self._states.get(self_id)
@@ -520,24 +574,63 @@ class StateMachine:
             # ---- Heartbeat says online ----
             was_pending = self._has_pending_signals(state)
 
+            # The first valid heartbeat is a durable confirmation event.  It
+            # is intentionally handled before the ordinary signal-clearing
+            # path so a brand-new connection cannot notify on admission.
+            if state.confirmed_status == QQStatus.OFFLINE:
+                self._save_pre_hb_recovery(state)
+                pre = self._pre_hb_recovery[self_id]
+                event_time = self._wall()
+                state.confirmed_status = QQStatus.ONLINE
+                state.last_status_change = event_time
+                state.offline_since = None
+                state.online_confirmed = True
+                state.signals.clear_all()
+                self._cancel_timer(state)
+                kind = (
+                    TransitionKind.FIRST_ONLINE
+                    if not pre.online_confirmed
+                    else TransitionKind.RECOVERED
+                )
+                pre.transition_context = self._queue_transition_context(
+                    self_id,
+                    kind,
+                    event_time=event_time,
+                    offline_since=self._safe_context_timestamp(pre.offline_since),
+                    episode_id=state.offline_episode_id,
+                )
+                return kind
+
             # Clear heartbeat-derived signals
+            if not state.online_confirmed:
+                self._save_pre_hb_recovery(state)
             state.signals.clear_heartbeat_false()
             state.signals.clear_heartbeat_miss()
             state.signals.clear_grace()
 
-            if state.confirmed_status == QQStatus.OFFLINE:
-                # OFFLINE → ONLINE recovery via heartbeat
-                self._save_pre_hb_recovery(state)
-                state.confirmed_status = QQStatus.ONLINE
-                state.last_status_change = self._wall()
-                state.offline_since = None
-                state.signals.clear_all()
-                self._cancel_timer(state)
-                return TransitionKind.RECOVERED
+            if not state.online_confirmed:
+                state.online_confirmed = True
+                event_time = self._wall()
+                state.last_status_change = event_time
+                if not self._has_pending_signals(state):
+                    self._cancel_timer(state)
+                kind = TransitionKind.FIRST_ONLINE
+                pre = self._pre_hb_recovery[self_id]
+                pre.transition_context = self._queue_transition_context(
+                    self_id,
+                    kind,
+                    event_time=event_time,
+                    episode_id=state.offline_episode_id,
+                )
+                return kind
             elif was_pending and not self._has_pending_signals(state):
                 # Was pending, now fully recovered — cancel timer
                 self._cancel_timer(state)
         else:
+            # An offline QQ must remain offline until a valid online heartbeat;
+            # false heartbeats cannot start a second timer or episode.
+            if state.confirmed_status != QQStatus.ONLINE or not state.online_confirmed:
+                return None
             # ---- Heartbeat says offline ----
             if state.signals.heartbeat_false_mono is None:
                 state.signals.heartbeat_false_mono = now_mono
@@ -560,6 +653,8 @@ class StateMachine:
         now_mono = self._monotonic()
         for state in list(self._states.values()):
             if state.confirmed_status != QQStatus.ONLINE:
+                continue
+            if not state.online_confirmed:
                 continue
             if state.signals.heartbeat_false_mono is not None:
                 # Already tracking a false heartbeat — don't add miss
@@ -592,12 +687,27 @@ class StateMachine:
         now_mono = self._monotonic()
         transitions: list[tuple[int, TransitionKind]] = []
         for self_id, state in list(self._states.items()):
+            if state.confirmed_status != QQStatus.ONLINE:
+                continue
+            if not state.online_confirmed:
+                continue
             if not self._has_pending_signals(state):
                 continue
             earliest = state.signals.earliest_mono
             if earliest is None:
                 continue
             if now_mono >= earliest + self._offline_timeout:
+                event_time = self._wall()
+                next_episode_id = state.offline_episode_id + 1
+                transition_context = _TransitionContext(
+                    kind=TransitionKind.OFFLINE_TIMEOUT,
+                    event_time=event_time,
+                    online_since=self._safe_context_timestamp(state.last_status_change),
+                    episode_id=next_episode_id,
+                )
+                self._transition_contexts.setdefault(self_id, []).append(
+                    transition_context
+                )
                 # Save pre-transition state for possible rollback
                 self._pre_timeout[self_id] = _PreTimeout(
                     confirmed_status=QQStatus.ONLINE,
@@ -605,10 +715,13 @@ class StateMachine:
                     offline_since=state.offline_since,
                     signals=copy.deepcopy(state.signals),
                     had_timer=state.pending_timer is not None,
+                    offline_episode_id=state.offline_episode_id,
+                    transition_context=transition_context,
                 )
                 state.confirmed_status = QQStatus.OFFLINE
-                state.last_status_change = self._wall()
+                state.last_status_change = event_time
                 state.offline_since = state.last_status_change
+                state.offline_episode_id += 1
                 state.signals.clear_all()
                 self._cancel_timer(state)
                 kind = TransitionKind.OFFLINE_TIMEOUT
@@ -625,6 +738,7 @@ class StateMachine:
         pre = self._pre_timeout.pop(self_id, None)
         if pre is None:
             return
+        self._discard_transition_context(self_id, pre.transition_context)
         state = self._states.get(self_id)
         if state is None:
             return
@@ -632,6 +746,7 @@ class StateMachine:
         state.last_status_change = pre.last_status_change
         state.offline_since = pre.offline_since
         state.signals = pre.signals
+        state.offline_episode_id = pre.offline_episode_id
         if pre.had_timer:
             self._schedule_timer(state)
 
@@ -645,6 +760,7 @@ class StateMachine:
         pre = self._pre_hb_recovery.pop(self_id, None)
         if pre is None:
             return
+        self._discard_transition_context(self_id, pre.transition_context)
         state = self._states.get(self_id)
         if state is None:
             return
@@ -652,6 +768,7 @@ class StateMachine:
         state.last_status_change = pre.last_status_change
         state.offline_since = pre.offline_since
         state.signals = pre.signals
+        state.online_confirmed = pre.online_confirmed
         self._schedule_timer(state)
 
     def fire_transition_event(
@@ -663,6 +780,14 @@ class StateMachine:
         The callback is dispatched as a background task — exceptions
         do **not** roll back the already-persisted state.
         """
+        if kind == TransitionKind.OFFLINE_TIMEOUT:
+            pre = self._pre_timeout.pop(self_id, None)
+            if pre is not None:
+                self._dispatch_transition_context(self_id, pre.transition_context)
+        elif kind in {TransitionKind.FIRST_ONLINE, TransitionKind.RECOVERED}:
+            pre = self._pre_hb_recovery.pop(self_id, None)
+            if pre is not None:
+                self._dispatch_transition_context(self_id, pre.transition_context)
         self._fire_callback(self_id, new_status, kind)
 
     # ------------------------------------------------------------------
@@ -710,6 +835,8 @@ class StateMachine:
                 "registered_at": s.registered_at,
                 "last_status_change": s.last_status_change,
                 "offline_since": s.offline_since,
+                "offline_episode_id": s.offline_episode_id,
+                "online_confirmed": s.online_confirmed,
             }
         return out
 
@@ -726,11 +853,71 @@ class StateMachine:
         return {
             "self_id": self_id,
             "status": view_status.value if view_status else "pending_offline",
+            "status_duration_seconds": self._status_duration_seconds(
+                state, view_status
+            ),
             "registered_at": state.registered_at,
             "last_status_change": state.last_status_change,
             "offline_since": state.offline_since,
             "last_heartbeat_at": state.last_heartbeat_at,
+            "offline_episode_id": state.offline_episode_id,
+            "online_confirmed": state.online_confirmed,
         }
+
+    def get_transition_context(
+        self, self_id: int, kind: TransitionKind
+    ) -> dict[str, float | int | None]:
+        """Return safe wall-clock details for a committed transition.
+
+        Timeout transitions retain the preceding online start and recovery
+        transitions retain the preceding offline start in a runtime-only
+        context.  No connection metadata is exposed here.
+        """
+        state = self._states.get(self_id)
+        contexts = self._transition_contexts.get(self_id, [])
+        context = next(
+            (
+                item
+                for item in contexts
+                if item.kind == kind
+                and (
+                    state is None
+                    or item.episode_id is None
+                    or item.episode_id == state.offline_episode_id
+                )
+            ),
+            None,
+        )
+        if context is not None:
+            details: dict[str, float | int | None] = {
+                "event_time": context.event_time,
+                "episode_id": context.episode_id,
+            }
+            if kind == TransitionKind.OFFLINE_TIMEOUT:
+                details["online_since"] = context.online_since
+            elif kind in {TransitionKind.FIRST_ONLINE, TransitionKind.RECOVERED}:
+                details["offline_since"] = context.offline_since
+            if context.dispatched:
+                self._discard_transition_context(self_id, context)
+            return details
+
+        if state is None:
+            details = {"event_time": None, "episode_id": None}
+            if kind == TransitionKind.OFFLINE_TIMEOUT:
+                details["online_since"] = None
+            elif kind in {TransitionKind.FIRST_ONLINE, TransitionKind.RECOVERED}:
+                details["offline_since"] = None
+            return details
+
+        details = {
+            "event_time": state.last_status_change,
+            "episode_id": state.offline_episode_id,
+        }
+        if kind == TransitionKind.OFFLINE_TIMEOUT:
+            details["online_since"] = None
+        elif kind in {TransitionKind.FIRST_ONLINE, TransitionKind.RECOVERED}:
+            details["offline_since"] = None
+        return details
 
     def get_all_views(self) -> dict[str, Any]:
         """Return safe public views for all registered QQs.
@@ -744,10 +931,15 @@ class StateMachine:
             out[str(sid)] = {
                 "self_id": sid,
                 "status": view_status.value if view_status else "pending_offline",
+                "status_duration_seconds": self._status_duration_seconds(
+                    s, view_status
+                ),
                 "registered_at": s.registered_at,
                 "last_status_change": s.last_status_change,
                 "offline_since": s.offline_since,
                 "last_heartbeat_at": s.last_heartbeat_at,
+                "offline_episode_id": s.offline_episode_id,
+                "online_confirmed": s.online_confirmed,
             }
         return out
 
@@ -763,6 +955,7 @@ class StateMachine:
         """
         now_mono = self._monotonic()
         self._states.clear()
+        self._transition_contexts.clear()
 
         for key, item in data.items():
             sid = int(key)
@@ -776,6 +969,11 @@ class StateMachine:
                 registered_at=item.get("registered_at", self._wall()),
                 last_status_change=item.get("last_status_change", self._wall()),
                 offline_since=item.get("offline_since"),
+                offline_episode_id=item.get("offline_episode_id", 0),
+                # Old snapshots represent already-observed online state.  A
+                # new snapshot explicitly stores False until the first valid
+                # heartbeat confirms a newly admitted connection.
+                online_confirmed=item.get("online_confirmed", True),
             )
 
             if old_status == QQStatus.ONLINE:
@@ -804,6 +1002,54 @@ class StateMachine:
     #  Internal helpers
     # ------------------------------------------------------------------
 
+    def _queue_transition_context(
+        self,
+        self_id: int,
+        kind: TransitionKind,
+        *,
+        event_time: float | None,
+        offline_since: float | None = None,
+        online_since: float | None = None,
+        episode_id: int | None = None,
+    ) -> _TransitionContext:
+        context = _TransitionContext(
+            kind=kind,
+            event_time=event_time,
+            offline_since=offline_since,
+            online_since=online_since,
+            episode_id=episode_id,
+        )
+        self._transition_contexts.setdefault(self_id, []).append(context)
+        return context
+
+    def _dispatch_transition_context(
+        self, self_id: int, context: _TransitionContext | None
+    ) -> None:
+        if context is not None:
+            context.dispatched = True
+
+    def _discard_transition_context(
+        self, self_id: int, context: _TransitionContext | None
+    ) -> None:
+        if context is None:
+            return
+        contexts = self._transition_contexts.get(self_id)
+        if contexts is None:
+            return
+        for index, item in enumerate(contexts):
+            if item is context:
+                contexts.pop(index)
+                break
+        if not contexts:
+            self._transition_contexts.pop(self_id, None)
+
+    @classmethod
+    def _safe_context_timestamp(cls, value: Any) -> float | None:
+        if not cls._is_finite_number(value):
+            return None
+        timestamp = float(value)
+        return timestamp if timestamp >= 0 else None
+
     def _view_status(self, state: _QQData) -> QQStatus | None:
         """Return the runtime-derived status.
 
@@ -821,13 +1067,61 @@ class StateMachine:
         """Check whether a QQ has any unresolved failure signals."""
         return state.signals.has_any
 
+    def _status_duration_seconds(
+        self, state: _QQData, view_status: QQStatus | None
+    ) -> float:
+        """Return a runtime-only, clock-safe duration for the public view.
+
+        Confirmed ONLINE and OFFLINE durations use wall-clock fields so they
+        survive a restart.  PENDING_OFFLINE is a runtime condition, so its
+        duration uses the monotonic start of the earliest active signal (or
+        the connection start for an unconfirmed initial connection).
+        """
+        if view_status == QQStatus.ONLINE:
+            if not state.online_confirmed:
+                return 0.0
+            return self._elapsed_seconds(self._wall(), state.last_status_change)
+
+        if view_status == QQStatus.OFFLINE:
+            start = state.offline_since
+            if not self._is_finite_number(start):
+                start = state.last_status_change
+            return self._elapsed_seconds(self._wall(), start)
+
+        # ``None`` represents the runtime-only PENDING_OFFLINE view.
+        start = state.signals.earliest_mono
+        if not self._is_finite_number(start) and not state.online_confirmed:
+            start = state.connection_established_mono
+        return self._elapsed_seconds(self._monotonic(), start)
+
+    @staticmethod
+    def _is_finite_number(value: Any) -> bool:
+        """Return whether *value* is a finite numeric timestamp."""
+        if isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    @classmethod
+    def _elapsed_seconds(cls, now: Any, start: Any) -> float:
+        """Calculate a nonnegative finite elapsed duration."""
+        if not cls._is_finite_number(now) or not cls._is_finite_number(start):
+            return 0.0
+        elapsed = float(now) - float(start)
+        if not math.isfinite(elapsed):
+            return 0.0
+        return max(0.0, elapsed)
+
     def _save_pre_hb_recovery(self, state: _QQData) -> None:
         """Save pre-transition state for heartbeat recovery rollback."""
         self._pre_hb_recovery[state.self_id] = _PreHbRecovery(
-            confirmed_status=QQStatus.OFFLINE,
+            confirmed_status=state.confirmed_status,
             last_status_change=state.last_status_change,
             offline_since=state.offline_since,
             signals=copy.deepcopy(state.signals),
+            online_confirmed=state.online_confirmed,
         )
 
     # ---- Timer management ----

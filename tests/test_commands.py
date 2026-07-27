@@ -81,9 +81,14 @@ class AstrMessageEvent:
         self.unified_msg_origin: str = ""
         self._sender_id: str = ""
         self._private = False
+        self.image_calls: list[object] = []
 
     def plain_result(self, text: str) -> str:
         return text
+
+    def image_result(self, image: object) -> dict[str, object]:
+        self.image_calls.append(image)
+        return {"image": image}
 
     def is_private_chat(self) -> bool:
         return self._private
@@ -461,6 +466,21 @@ class TestStatusCommand:
         assert "订阅群数量" in combined
         assert "待补发数量: 0" in combined
 
+    async def test_status_reports_real_pending_count(self, plugin_package: str) -> None:
+        """Status uses the notification store count instead of a placeholder."""
+        plugin = await self._make_plugin(plugin_package)
+        mod = importlib.import_module(plugin_package)
+        event = mod.AstrMessageEvent()
+
+        class PendingCountStub:
+            pending_count = 3
+
+        plugin._notification_manager = PendingCountStub()
+        results: list[str] = []
+        async for result in plugin.status(event):
+            results.append(result)
+        assert "待补发数量: 3" in "\n".join(results)
+
     async def test_status_no_sensitive_data(self, plugin_package: str) -> None:
         """Status output must NOT contain sensitive fields."""
         plugin = await self._make_plugin(plugin_package)
@@ -517,6 +537,230 @@ class TestStatusCommand:
         sub_snap_after = plugin._sub_store.get_snapshot()
         assert sub_snap_before == sub_snap_after
         assert save_call_count == 0
+
+    async def test_status_renders_dashboard_image_with_safe_data_and_options(
+        self, plugin_package: str
+    ) -> None:
+        """A valid renderer result uses the event image-result API once."""
+        mod = importlib.import_module(plugin_package)
+        plugin = await self._make_plugin(plugin_package)
+        plugin.config["instance_label"] = "主实例"
+        plugin._sm = type(
+            "StatusMachineStub",
+            (),
+            {
+                "get_all_views": lambda self: {
+                    "123456789": {
+                        "self_id": 123456789,
+                        "status": "online",
+                        "last_heartbeat_at": 1_700_000_000.0,
+                    },
+                    "222222222": {
+                        "self_id": 222222222,
+                        "status": "pending_offline",
+                        "last_heartbeat_at": 1_699_999_940.0,
+                    },
+                    "333333333": {
+                        "self_id": 333333333,
+                        "status": "offline",
+                        "last_heartbeat_at": None,
+                    },
+                },
+            },
+        )()
+        plugin._ws_server = type(
+            "WSServerStub",
+            (),
+            {"bound_port": 19090, "connection_count": 2},
+        )()
+        plugin._notification_manager = type(
+            "NotificationStub", (), {"pending_count": 4}
+        )()
+        plugin._profile_cache = type(
+            "ProfileCacheStub",
+            (),
+            {
+                "get": lambda self, self_id: (
+                    {
+                        "nickname": "昵称",
+                        "avatar_data_uri": (
+                            "data:image/png;base64,"
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                        ),
+                    }
+                    if self_id == 123456789
+                    else None
+                )
+            },
+        )()
+
+        captured: dict[str, Any] = {}
+
+        async def render(template: str, data: dict[str, Any], **kwargs: Any) -> bytes:
+            captured["template"] = template
+            captured["data"] = data
+            captured["options"] = kwargs["options"]
+            return b"\xff\xd8\xffstatus-image"
+
+        plugin.html_render = render
+        event = mod.AstrMessageEvent()
+        event.unified_msg_origin = "qq:GroupMessage:status"
+        plugin._sub_store.subscribe(event.unified_msg_origin, "owner-secret")
+        results: list[Any] = []
+        async for result in plugin.status(event):
+            results.append(result)
+
+        assert len(results) == 1
+        assert results[0]["image"] == b"\xff\xd8\xffstatus-image"
+        assert captured["template"]
+        assert captured["options"] == {
+            "full_page": True,
+            "type": "jpeg",
+            "quality": 90,
+            "viewport_width": 812,
+            "viewport_height": 320,
+            "device_scale_factor_level": "high",
+            "wait_until": "domcontentloaded",
+        }
+        data = captured["data"]
+        assert data["service_running"] is True
+        assert data["connection_count"] == 2
+        assert data["registered_count"] == 3
+        assert (data["online_count"], data["pending_count"], data["offline_count"]) == (
+            1,
+            1,
+            1,
+        )
+        assert data["subscription_count"] == 1
+        assert data["pending_delivery_count"] == 4
+        assert data["current_group_subscribed"] is True
+        assert data["instances"][0]["nickname"] == "昵称"
+        assert data["instances"][0]["avatar_data_uri"].startswith("data:image/png;")
+        assert data["instances"][0]["masked_qq"] == "12****89"
+        assert data["instances"][1]["status_label"] == "待确认"
+        assert data["instances"][2]["status_label"] == "离线"
+        assert "1700000000" not in repr(data)
+        assert "owner-secret" not in repr(data)
+        assert "qq:GroupMessage:status" not in repr(data)
+
+    async def test_status_current_group_state_and_empty_data_are_context_safe(
+        self, plugin_package: str
+    ) -> None:
+        plugin = await self._make_plugin(plugin_package)
+        plugin._sub_store.subscribe("qq:GroupMessage:1", "owner")
+        mod = importlib.import_module(plugin_package)
+
+        group_event = mod.AstrMessageEvent()
+        group_event.unified_msg_origin = "qq:GroupMessage:1"
+        assert (
+            plugin._build_status_data(group_event, now=1_700_000_000)[
+                "current_group_subscribed"
+            ]
+            is True
+        )
+
+        other_group = mod.AstrMessageEvent()
+        other_group.unified_msg_origin = "qq:GroupMessage:2"
+        assert (
+            plugin._build_status_data(other_group, now=1_700_000_000)[
+                "current_group_subscribed"
+            ]
+            is False
+        )
+
+        private_event = mod.AstrMessageEvent()
+        private_event._private = True
+        private_event.unified_msg_origin = "qq:GroupMessage:1"
+        assert (
+            plugin._build_status_data(private_event, now=1_700_000_000)[
+                "current_group_subscribed"
+            ]
+            is None
+        )
+
+        missing_event = mod.AstrMessageEvent()
+        assert (
+            plugin._build_status_data(missing_event, now=1_700_000_000)[
+                "current_group_subscribed"
+            ]
+            is None
+        )
+
+        empty = plugin._build_status_data(missing_event, now=1_700_000_000)
+        assert empty["instances"] == []
+        assert empty["registered_count"] == 0
+        assert empty["online_count"] == 0
+        assert empty["pending_count"] == 0
+        assert empty["offline_count"] == 0
+
+    @pytest.mark.parametrize("renderer", [None, "invalid", "error"])
+    async def test_status_renderer_failure_uses_safe_text_fallback(
+        self, plugin_package: str, renderer: object
+    ) -> None:
+        plugin = await self._make_plugin(plugin_package)
+        mod = importlib.import_module(plugin_package)
+        event = mod.AstrMessageEvent()
+        event.unified_msg_origin = "qq:GroupMessage:secret"
+        plugin._sub_store.subscribe(event.unified_msg_origin, "owner-secret")
+
+        if renderer == "invalid":
+
+            async def invalid(*args: Any, **kwargs: Any) -> bytes:
+                return b"not-image"
+
+            plugin.html_render = invalid
+        elif renderer == "error":
+
+            async def error(*args: Any, **kwargs: Any) -> bytes:
+                raise RuntimeError("renderer failure")
+
+            plugin.html_render = error
+
+        results: list[Any] = []
+        async for result in plugin.status(event):
+            results.append(result)
+        assert len(results) == 1
+        assert "WebSocket 服务端" in results[0]
+        assert "订阅群数量: 1" in results[0]
+        assert "qq:GroupMessage:secret" not in results[0]
+        assert "owner-secret" not in results[0]
+        assert "1700000000" not in results[0]
+        assert "subscriptions.json" not in results[0]
+
+    async def test_status_accepts_twenty_instances_in_one_render(
+        self, plugin_package: str
+    ) -> None:
+        plugin = await self._make_plugin(plugin_package)
+        mod = importlib.import_module(plugin_package)
+        calls = 0
+
+        plugin._sm = type(
+            "TwentyViews",
+            (),
+            {
+                "get_all_views": lambda self: {
+                    str(10000 + index): {
+                        "self_id": 10000 + index,
+                        "status": "online" if index % 2 else "offline",
+                        "last_heartbeat_at": None,
+                    }
+                    for index in range(20)
+                }
+            },
+        )()
+
+        async def render(*args: Any, **kwargs: Any) -> bytes:
+            nonlocal calls
+            calls += 1
+            return b"\xff\xd8\xfftwenty-image"
+
+        plugin.html_render = render
+        event = mod.AstrMessageEvent()
+        results: list[Any] = []
+        async for result in plugin.status(event):
+            results.append(result)
+        assert calls == 1
+        assert results[0]["image"] == b"\xff\xd8\xfftwenty-image"
 
 
 # ---------------------------------------------------------------------------

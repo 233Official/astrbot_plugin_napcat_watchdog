@@ -343,3 +343,54 @@ class TestInitializeFailClosed:
         finally:
             main_mod.StarTools.get_data_dir = original
             shutil.rmtree(fixed_dir, ignore_errors=True)
+
+
+class TestAdmissionHeartbeatOrdering:
+    """Admission persists registration but never emits online notifications."""
+
+    async def test_admission_is_silent_and_first_heartbeat_emits(
+        self, plugin_package: str, tmp_path: Path
+    ) -> None:
+        import asyncio
+
+        main_mod = importlib.import_module(plugin_package)
+        astrbot_api = importlib.import_module("astrbot.api")
+
+        class _Manager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, object, object]] = []
+
+            async def handle_transition(
+                self, self_id: int, status: object, kind: object, **kwargs: object
+            ) -> None:
+                self.calls.append((self_id, status, kind))
+
+        plugin = main_mod.NapCatWatchdogPlugin(
+            main_mod.Context(), astrbot_api.AstrBotConfig()
+        )
+        plugin._sm = main_mod.StateMachine(offline_timeout=10.0)
+        plugin._sm.set_transition_callback(plugin._on_transition)
+        plugin._snapshot_path = tmp_path / "state.json"
+        manager = _Manager()
+        plugin._notification_manager = manager
+
+        generation = await plugin._admit_connection(123)
+        await asyncio.sleep(0)
+        assert generation == 1
+        assert manager.calls == []
+        assert plugin._sm._states[123].online_confirmed is False
+        assert plugin._snapshot_path.exists()
+
+        await plugin._on_event(
+            123,
+            generation,
+            {
+                "post_type": "meta_event",
+                "meta_event_type": "heartbeat",
+                "status": {"online": True},
+            },
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert len(manager.calls) == 1
+        assert manager.calls[0][2] == main_mod.TransitionKind.FIRST_ONLINE

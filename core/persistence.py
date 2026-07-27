@@ -30,6 +30,8 @@ _PERSISTENT_KEYS: frozenset[str] = frozenset(
         "registered_at",
         "last_status_change",
         "offline_since",
+        "offline_episode_id",
+        "online_confirmed",
     }
 )
 
@@ -211,6 +213,27 @@ def _validate_entry(path: Path, sid_key: str, entry: Any) -> None:
                 f"a number or null, got {type(off_since).__name__}"
             )
             raise PersistenceError(msg)
+
+    # Episode identity is durable and only advances from zero upward.
+    episode_id = entry.get("offline_episode_id", 0)
+    if (
+        isinstance(episode_id, bool)
+        or not isinstance(episode_id, int)
+        or episode_id < 0
+    ):
+        msg = (
+            f"State file {path}: entry '{sid_key}' offline_episode_id must be "
+            "a non-negative integer"
+        )
+        raise PersistenceError(msg)
+
+    # New snapshots explicitly record whether a valid online heartbeat has
+    # confirmed the connection.  The field remains optional for schema-1
+    # snapshots so existing state files can be loaded without data loss.
+    online_confirmed = entry.get("online_confirmed", True)
+    if not isinstance(online_confirmed, bool):
+        msg = f"State file {path}: entry '{sid_key}' online_confirmed must be a bool"
+        raise PersistenceError(msg)
 
 
 def snapshot_exists(path: Path) -> bool:
