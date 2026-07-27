@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NapCat Watchdog 通知卡片预览</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body { padding: 32px; color: #242321; background: #e6e1da; font-family: "Avenir Next", "SF Pro Display", "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei", sans-serif; -webkit-font-smoothing: antialiased; }
+    .preview-stack { display: grid; gap: 26px; width: 780px; margin: 0 auto; }
+    .preview-label { margin: 0 0 -14px 4px; color: #6e675f; font-size: 13px; font-weight: 800; }
+    .notification-card { --accent:#dc5b4f; --accent-dark:#a93630; --accent-soft:#fff0ed; --accent-line:#f1c5bf; width:780px; overflow:hidden; border:1px solid #d9d3cb; border-radius:24px; background:#fbfaf8; box-shadow:0 20px 48px rgba(69,57,45,.13),0 3px 9px rgba(69,57,45,.06); }
+    .notification-card.recovered { --accent:#239a82; --accent-dark:#126c5c; --accent-soft:#e9f7f3; --accent-line:#b8dfd5; }
+    .accent-line { height:6px; background:var(--accent); }
+    .card-body { padding:22px 28px 19px; }
+    .topline,.footer { display:flex; align-items:center; justify-content:space-between; gap:24px; }
+    .topline { margin-bottom:18px; }
+    .service-meta { display:inline-flex; align-items:center; gap:10px; color:#3d3934; font-size:14px; font-weight:800; }
+    .service-dot { width:8px; height:8px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 5px var(--accent-soft); }
+    .status-badge { display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border:1px solid var(--accent-line); border-radius:999px; color:var(--accent-dark); background:var(--accent-soft); font-size:14px; font-weight:800; }
+    .status-badge:before { content:""; width:7px; height:7px; border-radius:50%; background:var(--accent); }
+    .event-grid { display:grid; grid-template-columns:minmax(0,1fr) 294px; gap:20px; align-items:center; }
+    .event-summary { display:grid; grid-template-columns:64px minmax(0,1fr); gap:17px; align-items:center; }
+    .status-icon { display:flex; width:64px; height:64px; align-items:center; justify-content:center; border:1px solid var(--accent-line); border-radius:19px; color:var(--accent-dark); background:var(--accent-soft); }
+    .status-icon svg { width:32px; height:32px; }
+    .title { margin:0; color:#24211e; font-size:34px; font-weight:780; line-height:1.12; letter-spacing:-.035em; }
+    .subtitle { margin:8px 0 0; color:#716b63; font-size:15px; line-height:1.5; }
+    .account-block { display:grid; grid-template-columns:68px minmax(0,1fr); gap:14px; align-items:center; padding:12px; border:1px solid #e1dcd5; border-radius:18px; background:#f4f1ed; }
+    .avatar { position:relative; display:flex; width:68px; height:68px; overflow:hidden; align-items:center; justify-content:center; border:2px solid #fff; border-radius:50%; color:var(--accent-dark); background:var(--accent-soft); box-shadow:0 5px 14px rgba(65,54,43,.14),0 0 0 1px var(--accent-line); font-size:24px; font-weight:850; }
+    .avatar:after { content:""; position:absolute; right:5px; bottom:5px; width:10px; height:10px; border:2px solid #fff; border-radius:50%; background:var(--accent); }
+    .avatar img { display:block; width:100%; height:100%; object-fit:cover; }
+    .account-copy { min-width:0; }
+    .nickname { overflow:hidden; margin:0; color:#292622; font-size:19px; font-weight:820; line-height:1.25; text-overflow:ellipsis; white-space:nowrap; }
+    .account-number { display:block; margin-top:5px; color:#6d665e; font-family:"SFMono-Regular","Cascadia Code","Roboto Mono","PingFang SC",monospace; font-size:14px; font-weight:750; letter-spacing:.04em; }
+    .instance-label { display:inline-block; max-width:100%; overflow:hidden; margin-top:6px; padding:3px 7px; border:1px solid #ded7cf; border-radius:999px; color:#797168; background:rgba(255,255,255,.64); font-size:11px; font-weight:750; text-overflow:ellipsis; white-space:nowrap; }
+    .metrics { display:grid; grid-template-columns:1.25fr .75fr; margin-top:16px; overflow:hidden; border:1px solid #dfdad3; border-radius:15px; background:#fff; }
+    .metric { min-width:0; padding:12px 15px 11px; }
+    .metric + .metric { border-left:1px solid #e4dfd8; }
+    .metric-label { display:block; margin-bottom:5px; color:#756e66; font-size:12px; font-weight:800; }
+    .metric-value { display:block; color:#2f2b27; font-size:16px; font-weight:800; line-height:1.3; }
+    .metric:last-child .metric-value { color:var(--accent-dark); }
+    .reason-note { margin-top:11px; padding:10px 13px; border-left:3px solid var(--accent); border-radius:5px 11px 11px 5px; color:#5f5952; background:var(--accent-soft); font-size:14px; line-height:1.4; }
+    .reason-note strong { color:var(--accent-dark); }
+    .footer { margin-top:14px; padding-top:13px; border-top:1px solid #e5e0d9; color:#918a81; font-size:12px; font-weight:650; }
+    .footer-source { color:#625c54; font-weight:800; }
+  </style>
+</head>
+<body>
+  <main class="preview-stack">
+    <p class="preview-label">离线示例</p>
+    <article class="notification-card offline">
+      <div class="accent-line"></div>
+      <div class="card-body">
+        <div class="topline"><div class="service-meta"><span class="service-dot"></span><span>NapCat</span></div><span class="status-badge">连接异常</span></div>
+        <section class="event-grid">
+          <div class="event-summary">
+            <div class="status-icon"><svg viewBox="0 0 48 48" fill="none"><path d="M24 7.5L42 39H6L24 7.5Z" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/><path d="M24 18V27" stroke="currentColor" stroke-width="3.6" stroke-linecap="round"/><circle cx="24" cy="33" r="2" fill="currentColor"/></svg></div>
+            <div><h1 class="title">账号连接中断</h1><p class="subtitle">暂时无法保持在线，正在持续监测。</p></div>
+          </div>
+          <div class="account-block">
+            <div class="avatar"><span>林</span></div>
+            <div class="account-copy"><p class="nickname">林间小站</p><span class="account-number">12****34</span><span class="instance-label">主实例</span></div>
+          </div>
+        </section>
+        <section class="metrics"><div class="metric"><span class="metric-label">发生时间</span><span class="metric-value">2026-07-25 14:32</span></div><div class="metric"><span class="metric-label">本次在线时长</span><span class="metric-value">3天 6小时 12分钟</span></div></section>
+        <div class="reason-note"><strong>状态说明</strong>　心跳响应超时</div>
+        <footer class="footer"><span class="footer-source">NapCat Watchdog</span><span>脱敏事件通知</span></footer>
+      </div>
+    </article>
+
+    <p class="preview-label">恢复示例</p>
+    <article class="notification-card recovered">
+      <div class="accent-line"></div>
+      <div class="card-body">
+        <div class="topline"><div class="service-meta"><span class="service-dot"></span><span>NapCat</span></div><span class="status-badge">连接已恢复</span></div>
+        <section class="event-grid">
+          <div class="event-summary">
+            <div class="status-icon"><svg viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="17" stroke="currentColor" stroke-width="3.4"/><path d="M15.5 24.5L21.2 30L32.8 18.2" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            <div><h1 class="title">账号已恢复在线</h1><p class="subtitle">连接已经恢复，监测继续运行。</p></div>
+          </div>
+          <div class="account-block">
+            <div class="avatar"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAC5ElEQVR42u1az28SQRT+GH5JqSamejImYsMPA2u09dAaTy1eatuDd2+ePPonGOPNkxdj4h9gYiJUW+PNxKgHKA1bBMUAiQgtlVikLZhUwMM2hAhsF3Z2d7buHMgGHu9938w3M/tmnmn8yT3ouRHovBkEDAIGAZ03ixJOa7lCv59GXGcYJSACup8ZFTIW1aD3+6NMGhZNoFOkYdEQOhUahAX0cjwTdtAP558whX6IKIQ19IPGIgyiHygiYRO99LiEWfQSox/1t1Ftu18KhiM9Aix0/6FIju4IsNP94njoJDTFB4/bz6F45M6zp+L2z2/fvXreIzwnN74HH91nKCe+fuGi3WIVMTg9emLK5WYxqa/U9wA4bfYZr1/EbM5/mZhM5d0dBQkMNwGKle3UZgHAIndFxGyemwDwJhWnMg0oS2jl0xqAoI87Zu2tolOjx6fOuQEsJ2IsngsJBJw2+4wn0NPghn/CTEj1d+199guLBFKbhUy5BGCRmxTRz+tkfL/RYPRkbomP9lNRWz8v+VV2jxbDfBTAiM0+6w10rz9mQir1vXeZFLsE0lsbn0tFAAtda9F8YBLASmKNln6UehcKxSMAgt6Aw2rr1M+0yw0gxEdZP50WCPyjIkE/P3arH3NpxQnIPK/8tl2O5XMAFjrWIkE/r9ZjjWZzOLc9USn1On2gIh8nqGjMeaCfF/GIPi44ltajzVbLYbUFfRyAOf8lMyGFys/VfFYfBLZ2qh+y6baKhM8wH221WioRkH/7EOIjAGa9gbMnx6ZdnvY3FCeAsinlciK23/jjsNoe3rxlJiRTLiWKeVWTepmD8Ktee/s1CeDauK89rel2v+JJfeeaE6a6f7Wb6dBiD82ze3Eh/AcX3dRvdil2v9QR0IqDlLiEoi/10Q82B9TkID0WUcivOuiHWYWU5jCof6JCDEU9W+REorjHqV0rQZGGltUqMmmwUi/UjUaXFVta7RhG1aJBwCCg8/YXc7kZtCJ6ytsAAAAASUVORK5CYII=" alt=""></div>
+            <div class="account-copy"><p class="nickname">Mori</p><span class="account-number">98****21</span><span class="instance-label">备用实例</span></div>
+          </div>
+        </section>
+        <section class="metrics"><div class="metric"><span class="metric-label">恢复时间</span><span class="metric-value">2026-07-25 14:38</span></div><div class="metric"><span class="metric-label">离线时长</span><span class="metric-value">6 分钟</span></div></section>
+        <footer class="footer"><span class="footer-source">NapCat Watchdog</span><span>脱敏事件通知</span></footer>
+      </div>
+    </article>
+  </main>
+</body>
+</html>

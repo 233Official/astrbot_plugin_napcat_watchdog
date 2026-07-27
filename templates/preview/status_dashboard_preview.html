@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NapCat 监控状态预览</title>
+  <style>
+    * { box-sizing:border-box; }
+    html,body { width:fit-content; min-width:0; min-height:0; height:auto; margin:0; padding:0; background:#eeeae4; }
+    body { display:block; padding:16px; overflow:hidden; color:#242321; font-family:"Avenir Next","SF Pro Display","HarmonyOS Sans SC","MiSans","PingFang SC","Microsoft YaHei",sans-serif; -webkit-font-smoothing:antialiased; }
+    .dashboard { --service-accent:#239a82; --service-dark:#126c5c; --service-soft:#e9f7f3; --service-line:#b8dfd5; width:780px; overflow:hidden; border:1px solid #d9d3cb; border-radius:24px; background:#fbfaf8; box-shadow:0 20px 48px rgba(69,57,45,.13),0 3px 9px rgba(69,57,45,.06); }
+    .accent-line { height:6px; background:var(--service-accent); }
+    .dashboard-body { padding:24px 28px 20px; }
+    .header { display:flex; align-items:flex-start; justify-content:space-between; gap:28px; }
+    .title { margin:0; color:#24211e; font-size:34px; font-weight:790; line-height:1.12; letter-spacing:-.035em; }
+    .updated-at { margin:8px 0 0; color:#7c756d; font-size:13px; font-weight:650; }
+    .service-badge { display:inline-flex; align-items:center; gap:8px; margin-top:2px; padding:9px 13px; border:1px solid var(--service-line); border-radius:999px; color:var(--service-dark); background:var(--service-soft); font-size:14px; font-weight:820; }
+    .service-badge:before { content:""; width:8px; height:8px; border-radius:50%; background:var(--service-accent); }
+    .summary { margin-top:20px; }
+    .summary-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); overflow:hidden; border:1px solid #dfdad3; border-radius:17px; background:#fff; }
+    .summary-item { padding:15px 16px 14px; }
+    .summary-item + .summary-item { border-left:1px solid #e5e0d9; }
+    .summary-value { display:block; color:#292622; font-size:27px; font-weight:820; line-height:1; }
+    .summary-label { display:block; margin-top:8px; color:#746d65; font-size:12px; font-weight:780; }
+    .health-strip { display:flex; align-items:center; gap:9px; margin-top:10px; }
+    .health-chip { display:inline-flex; align-items:center; gap:7px; padding:7px 10px; border:1px solid; border-radius:999px; font-size:12px; font-weight:800; }
+    .health-chip strong { font-size:14px; }
+    .health-chip.online { color:#126c5c; border-color:#b8dfd5; background:#e9f7f3; }
+    .health-chip.pending { color:#916312; border-color:#ead39b; background:#fff6de; }
+    .health-chip.offline { color:#a93630; border-color:#f1c5bf; background:#fff0ed; }
+    .subscription-panel { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-top:16px; padding:13px 15px; border:1px solid #dfdad3; border-radius:15px; background:#f4f1ed; }
+    .subscription-title { color:#34302c; font-size:14px; font-weight:820; }
+    .subscription-detail { margin-left:8px; color:#756e66; font-size:13px; font-weight:650; }
+    .group-badge { padding:6px 10px; border:1px solid #b8dfd5; border-radius:999px; color:#126c5c; background:#e9f7f3; font-size:12px; font-weight:780; }
+    .section-heading { display:flex; align-items:center; justify-content:space-between; margin:20px 0 10px; }
+    .section-title { margin:0; color:#393530; font-size:16px; font-weight:820; }
+    .section-count { color:#898178; font-size:12px; font-weight:750; }
+    .instance-list { overflow:hidden; border:1px solid #dfdad3; border-radius:18px; background:#fff; }
+    .instance-row { --row-accent:#dc5b4f; --row-dark:#a93630; --row-soft:#fff0ed; --row-line:#f1c5bf; display:grid; grid-template-columns:52px minmax(0,1fr) minmax(260px,1.1fr) auto; gap:14px; align-items:center; min-height:78px; padding:12px 14px; }
+    .instance-row + .instance-row { border-top:1px solid #e8e3dd; }
+    .instance-row.online { --row-accent:#239a82; --row-dark:#126c5c; --row-soft:#e9f7f3; --row-line:#b8dfd5; }
+    .instance-row.pending { --row-accent:#d49a2f; --row-dark:#916312; --row-soft:#fff6de; --row-line:#ead39b; }
+    .avatar { position:relative; display:flex; width:52px; height:52px; overflow:hidden; align-items:center; justify-content:center; border:2px solid #fff; border-radius:50%; color:var(--row-dark); background:var(--row-soft); box-shadow:0 3px 10px rgba(65,54,43,.12),0 0 0 1px var(--row-line); font-size:19px; font-weight:850; }
+    .avatar:after { content:""; position:absolute; right:2px; bottom:2px; width:9px; height:9px; border:2px solid #fff; border-radius:50%; background:var(--row-accent); }
+    .avatar img { display:block; width:100%; height:100%; object-fit:cover; }
+    .identity { min-width:0; }
+    .identity-topline { display:flex; min-width:0; align-items:center; gap:8px; }
+    .nickname { min-width:0; overflow:hidden; margin:0; color:#2b2824; font-size:17px; font-weight:820; line-height:1.25; text-overflow:ellipsis; white-space:nowrap; }
+    .instance-label { max-width:120px; overflow:hidden; padding:3px 7px; border:1px solid #dfd8d0; border-radius:999px; color:#7d756c; background:#f5f2ee; font-size:10px; font-weight:760; text-overflow:ellipsis; white-space:nowrap; }
+    .account-number { display:block; margin-top:5px; color:#756e66; font-family:"SFMono-Regular","Cascadia Code","Roboto Mono","PingFang SC",monospace; font-size:13px; font-weight:730; letter-spacing:.04em; }
+    .meta-group { display:grid; grid-template-columns:minmax(0,.82fr) minmax(0,1.18fr); gap:12px; min-width:0; }
+    .meta-item { min-width:0; }
+    .meta-item + .meta-item { padding-left:12px; border-left:1px solid #e4dfd8; }
+    .meta-label { display:block; margin-bottom:4px; color:#8a8279; font-size:11px; font-weight:780; line-height:1.15; }
+    .meta-value { display:block; overflow-wrap:anywhere; color:#49443e; font-size:13px; font-weight:740; line-height:1.25; }
+    .row-status { min-width:70px; padding:7px 10px; border:1px solid var(--row-line); border-radius:999px; color:var(--row-dark); background:var(--row-soft); font-size:12px; font-weight:830; text-align:center; }
+    .footer { display:flex; align-items:center; justify-content:space-between; gap:24px; margin-top:15px; padding-top:13px; border-top:1px solid #e5e0d9; color:#918a81; font-size:12px; font-weight:650; }
+    .footer strong { color:#625c54; font-weight:800; }
+  </style>
+</head>
+<body>
+  <main class="dashboard">
+    <div class="accent-line"></div>
+    <div class="dashboard-body">
+      <header class="header"><div><h1 class="title">NapCat 监控状态</h1><p class="updated-at">更新于 2026-07-26 18:42</p></div><span class="service-badge">运行中</span></header>
+      <section class="summary">
+        <div class="summary-grid">
+          <div class="summary-item"><span class="summary-value">2</span><span class="summary-label">当前连接</span></div>
+          <div class="summary-item"><span class="summary-value">3</span><span class="summary-label">注册实例</span></div>
+          <div class="summary-item"><span class="summary-value">12</span><span class="summary-label">群订阅</span></div>
+          <div class="summary-item"><span class="summary-value">2</span><span class="summary-label">待投递</span></div>
+        </div>
+        <div class="health-strip"><span class="health-chip online">在线 <strong>1</strong></span><span class="health-chip pending">待确认 <strong>1</strong></span><span class="health-chip offline">离线 <strong>1</strong></span></div>
+      </section>
+      <section class="subscription-panel"><div><span class="subscription-title">订阅概况</span><span class="subscription-detail">共 12 个群</span></div><span class="group-badge">当前群已订阅</span></section>
+      <section>
+        <div class="section-heading"><h2 class="section-title">实例状态</h2><span class="section-count">共 3 个</span></div>
+        <div class="instance-list">
+          <article class="instance-row online">
+            <div class="avatar"><span>林</span></div>
+            <div class="identity"><div class="identity-topline"><h3 class="nickname">林间小站</h3><span class="instance-label">主实例</span></div><span class="account-number">12****34</span></div>
+            <div class="meta-group"><div class="meta-item"><span class="meta-label">最近心跳</span><span class="meta-value">刚刚</span></div><div class="meta-item"><span class="meta-label">在线时长</span><span class="meta-value">2天 5小时 18分钟</span></div></div><span class="row-status">在线</span>
+          </article>
+          <article class="instance-row pending">
+            <div class="avatar"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlPgAAAAASUVORK5CYII=" alt=""></div>
+            <div class="identity"><div class="identity-topline"><h3 class="nickname">Mori</h3><span class="instance-label">备用实例</span></div><span class="account-number">98****21</span></div>
+            <div class="meta-group"><div class="meta-item"><span class="meta-label">最近心跳</span><span class="meta-value">42 秒前</span></div><div class="meta-item"><span class="meta-label">待确认时长</span><span class="meta-value">1分钟</span></div></div><span class="row-status">待确认</span>
+          </article>
+          <article class="instance-row offline">
+            <div class="avatar"><span>值</span></div>
+            <div class="identity"><div class="identity-topline"><h3 class="nickname">值守机器人</h3></div><span class="account-number">65****09</span></div>
+            <div class="meta-group"><div class="meta-item"><span class="meta-label">最近心跳</span><span class="meta-value">18 分钟前</span></div><div class="meta-item"><span class="meta-label">离线时长</span><span class="meta-value">3小时 42分钟</span></div></div><span class="row-status">离线</span>
+          </article>
+        </div>
+      </section>
+      <footer class="footer"><strong>NapCat Watchdog</strong><span>仅展示脱敏账号信息</span></footer>
+    </div>
+  </main>
+</body>
+</html>
