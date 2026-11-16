@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
@@ -38,8 +37,6 @@ from .core.notifications import _mask_qq as _mask_qq_for_dashboard
 from .core.profile import data_uri_is_valid, sanitize_nickname
 from .core.token import ensure_access_token
 
-logger = logging.getLogger(__name__)
-
 _SWEEP_INTERVAL = 30.0
 """Seconds between heartbeat timeout sweep cycles."""
 
@@ -56,14 +53,14 @@ _STATUS_TEMPLATE = (
     Path(__file__).resolve().parent / "templates" / "status_dashboard.html"
 )
 _STATUS_LABELS = {
-    "online": "在线",
+    "online": "监控正常",
     "pending_offline": "待确认",
-    "offline": "离线",
+    "offline": "监控失联",
 }
 _STATUS_DURATION_LABELS = {
-    "online": "在线时长",
+    "online": "监控正常时长",
     "pending_offline": "待确认时长",
-    "offline": "离线时长",
+    "offline": "失联时长",
 }
 
 
@@ -208,13 +205,24 @@ class NapCatWatchdogPlugin(Star):
             raise RuntimeError("Corrupt subscription file; refusing startup") from e
 
         # ---- 4b. Pending notifications ----
-        self._profile_cache = ProfileCache()
+        self._profile_cache = ProfileCache(
+            storage_dir=data_dir / "profiles",
+            on_cache_error=lambda operation: logger.warning(
+                "OneBot profile cache %s failed; monitoring state is unchanged",
+                operation,
+            ),
+        )
+        await asyncio.to_thread(
+            self._profile_cache.load,
+            tuple(int(self_id) for self_id in (loaded_snapshot or {})),
+        )
         self._notification_manager = NotificationManager(
             self.context,
             self._sub_store,
             self._pending_path,
             html_render=getattr(self, "html_render", None),
             profile_provider=self._get_profile,
+            profile_waiter=self._wait_for_profile,
             instance_label=str(self.config.get("instance_label", "") or ""),
         )
         try:
@@ -259,6 +267,9 @@ class NapCatWatchdogPlugin(Star):
         self._ws_server.set_event_callback(self._on_event)
         self._ws_server.set_disconnect_callback(self._on_disconnect)
         self._ws_server.set_profile_callback(self._on_profile)
+        self._ws_server.set_profile_refresh_predicate(
+            self._profile_cache.should_refresh
+        )
 
         # ---- 7. Start WS server ----
         try:
@@ -306,8 +317,6 @@ class NapCatWatchdogPlugin(Star):
                 self._notification_manager.persist()
             except NotificationPersistenceError:
                 logger.exception("Failed to persist pending notifications on shutdown")
-        if self._profile_cache is not None:
-            self._profile_cache.clear()
 
         if self._sweep_task is not None:
             self._sweep_task.cancel()
@@ -330,6 +339,9 @@ class NapCatWatchdogPlugin(Star):
             except Exception as e:
                 logger.error("Error stopping Watchdog WS server: %s", e)
             self._ws_server = None
+        if self._profile_cache is not None:
+            self._profile_cache.clear()
+            self._profile_cache = None
 
     # ---- Coordinator callbacks ----
 
@@ -403,10 +415,16 @@ class NapCatWatchdogPlugin(Star):
             return None
         return self._profile_cache.get(self_id)
 
+    async def _wait_for_profile(self, self_id: int) -> None:
+        """Wait for existing enrichment without starting network work."""
+        server = self._ws_server
+        if server is not None:
+            await server.wait_for_profile(self_id)
+
     async def _on_profile(self, self_id: int, generation: int, nickname: str) -> None:
         """Best-effort profile enrichment; never affects watchdog state."""
         cache = self._profile_cache
-        if cache is None:
+        if cache is None or self._shutting_down:
             return
         try:
             await cache.update(self_id, nickname)
@@ -483,6 +501,8 @@ class NapCatWatchdogPlugin(Star):
                 await asyncio.sleep(_SWEEP_INTERVAL)
                 if self._sm is None:
                     continue
+                if self._ws_server is not None:
+                    self._ws_server.refresh_profiles()
 
                 self._sm.sweep_heartbeat_timeouts()
                 transitions = self._sm.check_timeouts()
@@ -685,9 +705,9 @@ class NapCatWatchdogPlugin(Star):
             f"WebSocket 服务端: {service}",
             f"当前连接数: {data['connection_count']}",
             f"已登记实例数: {data['registered_count']}",
-            f"在线实例数: {data['online_count']}",
+            f"监控正常实例数: {data['online_count']}",
             f"待确认实例数: {data['pending_count']}",
-            f"离线实例数: {data['offline_count']}",
+            f"失联实例数: {data['offline_count']}",
         ]
         for instance in data["instances"]:
             label = (

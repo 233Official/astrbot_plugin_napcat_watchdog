@@ -1,101 +1,294 @@
-"""Best-effort in-memory NapCat profile and QQ avatar enrichment."""
+"""Best-effort durable display profiles and validated QQ avatar enrichment."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import binascii
+import itertools
+import json
+import math
+import os
+import tempfile
+import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 
 MAX_AVATAR_BYTES = 512 * 1024
 AVATAR_READ_CHUNK_BYTES = 64 * 1024
-DEFAULT_AVATAR_TTL = 300.0
+MAX_PROFILE_BYTES = 1024 * 1024
+MAX_RESTORED_PROFILES = 20
+DEFAULT_NICKNAME_TTL = 24 * 60 * 60.0
+DEFAULT_AVATAR_TTL = 24 * 60 * 60.0
+DEFAULT_REFRESH_COOLDOWN = 5 * 60.0
 DEFAULT_AVATAR_TIMEOUT = 2.0
 QQ_AVATAR_URL = "https://q1.qlogo.cn/g?b=qq&nk={self_id}&s=640"
 
 
 @dataclass(frozen=True)
 class ProfileSnapshot:
-    """Safe display-only profile data; never persisted."""
+    """Safe display-only profile data."""
 
     self_id: int
     nickname: str | None = None
     avatar_data_uri: str | None = None
 
 
+@dataclass(frozen=True)
+class _CachedProfile:
+    snapshot: ProfileSnapshot
+    nickname_updated_at: float | None = None
+    avatar_updated_at: float | None = None
+
+
 AvatarFetcher = Callable[[int], Awaitable[Any]]
 
 
 class ProfileCache:
-    """Cache nicknames and short-lived, validated avatar data URIs."""
+    """Keep successful profiles displayable while refreshing stale fields."""
 
     def __init__(
         self,
         *,
+        storage_dir: Path | None = None,
         avatar_fetcher: AvatarFetcher | None = None,
+        nickname_ttl: float = DEFAULT_NICKNAME_TTL,
         avatar_ttl: float = DEFAULT_AVATAR_TTL,
         avatar_timeout: float = DEFAULT_AVATAR_TIMEOUT,
-        clock: Callable[[], float] = time.monotonic,
+        on_cache_error: Callable[[str], None] | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
+        self._storage_dir = storage_dir
         self._avatar_fetcher = avatar_fetcher
+        self._nickname_ttl = max(1.0, float(nickname_ttl))
         self._avatar_ttl = max(1.0, float(avatar_ttl))
         self._avatar_timeout = max(0.05, min(float(avatar_timeout), 10.0))
         self._clock = clock
-        self._profiles: dict[int, ProfileSnapshot] = {}
-        self._avatars: dict[int, tuple[float, str | None]] = {}
+        self._on_cache_error = on_cache_error
+        self._profiles: dict[int, _CachedProfile] = {}
+        self._refresh_attempts: dict[int, float] = {}
+        self._avatar_attempts: dict[int, float] = {}
+        self._revisions: dict[int, int] = {}
+        self._revision_counter = itertools.count(1)
+        self._update_locks: dict[int, asyncio.Lock] = {}
+        # A cancelled to_thread waiter does not stop its writer. Serialize
+        # replacements and reject obsolete revisions inside the worker too.
+        self._storage_lock = threading.Lock()
 
     def get(self, self_id: int) -> ProfileSnapshot | None:
-        return self._profiles.get(self_id)
+        cached = self._profiles.get(self_id)
+        return cached.snapshot if cached is not None else None
 
     def clear(self, self_id: int | None = None) -> None:
+        """Forget memory only; durable successful profiles remain available."""
         if self_id is None:
             self._profiles.clear()
-            self._avatars.clear()
+            self._refresh_attempts.clear()
+            self._avatar_attempts.clear()
+            self._revisions.clear()
             return
         self._profiles.pop(self_id, None)
-        self._avatars.pop(self_id, None)
+        self._refresh_attempts.pop(self_id, None)
+        self._avatar_attempts.pop(self_id, None)
+        self._revisions.pop(self_id, None)
+
+    def load(self, self_ids: Iterable[int]) -> None:
+        """Restore only bounded, known accounts; call off the event loop."""
+        if self._storage_dir is None:
+            return
+        for self_id in itertools.islice(self_ids, MAX_RESTORED_PROFILES):
+            if not _valid_self_id(self_id) or self_id in self._profiles:
+                continue
+            try:
+                with (self._storage_dir / f"{self_id}.json").open("rb") as source:
+                    raw = source.read(MAX_PROFILE_BYTES + 1)
+                if len(raw) > MAX_PROFILE_BYTES:
+                    raise ValueError("oversized profile cache")
+                cached = _validated_cached_profile(json.loads(raw), self_id)
+                if cached is None:
+                    raise ValueError("invalid profile cache")
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, UnicodeError, RecursionError):
+                self._report_cache_error("read")
+                continue
+            self._profiles.setdefault(self_id, cached)
+
+    def should_refresh(self, self_id: int) -> bool:
+        """Claim a due lookup, suppressing repeated failed attempts for 5 min."""
+        if not _valid_self_id(self_id):
+            return False
+        now = self._clock()
+        cached = self._profiles.get(self_id)
+        if cached is not None and (
+            _is_fresh(cached.nickname_updated_at, now, self._nickname_ttl)
+            and _is_fresh(cached.avatar_updated_at, now, self._avatar_ttl)
+        ):
+            return False
+        if _is_fresh(
+            self._refresh_attempts.get(self_id), now, DEFAULT_REFRESH_COOLDOWN
+        ):
+            return False
+        self._refresh_attempts[self_id] = now
+        return True
 
     async def update(self, self_id: int, nickname: str) -> ProfileSnapshot:
-        """Store a safe nickname and enrich it with a best-effort avatar."""
+        """Publish nickname immediately, then independently refresh the avatar."""
+        if not _valid_self_id(self_id):
+            raise ValueError("self_id must be a positive integer")
+        now = self._clock()
+        previous = self._profiles.get(self_id)
+        old_snapshot = (
+            previous.snapshot if previous is not None else ProfileSnapshot(self_id)
+        )
         safe_nickname = sanitize_nickname(nickname)
-        avatar_data_uri = await self._get_avatar(self_id)
         profile = ProfileSnapshot(
             self_id=self_id,
-            nickname=safe_nickname,
-            avatar_data_uri=avatar_data_uri,
+            nickname=safe_nickname or old_snapshot.nickname,
+            avatar_data_uri=old_snapshot.avatar_data_uri,
         )
-        self._profiles[self_id] = profile
-        return profile
+        cached = _CachedProfile(
+            profile,
+            now
+            if safe_nickname
+            else (previous.nickname_updated_at if previous else None),
+            previous.avatar_updated_at if previous else None,
+        )
+        revision = next(self._revision_counter)
+        self._revisions[self_id] = revision
+        self._profiles[self_id] = cached
+        self._refresh_attempts[self_id] = now
+        lock = self._update_locks.setdefault(self_id, asyncio.Lock())
+        async with lock:
+            if self._revisions.get(self_id) != revision:
+                return self.get(self_id) or profile
+            await self._persist(self_id, revision, cached)
+            if self._revisions.get(self_id) != revision:
+                return self.get(self_id) or profile
+            now = self._clock()
+            if _is_fresh(cached.avatar_updated_at, now, self._avatar_ttl) or _is_fresh(
+                self._avatar_attempts.get(self_id), now, DEFAULT_REFRESH_COOLDOWN
+            ):
+                return profile
+            self._avatar_attempts[self_id] = now
+            try:
+                avatar_data_uri = await self._get_avatar(self_id)
+            except asyncio.CancelledError:
+                self._avatar_attempts.pop(self_id, None)
+                raise
+            if self._revisions.get(self_id) != revision:
+                self._avatar_attempts.pop(self_id, None)
+                return self.get(self_id) or profile
+            if avatar_data_uri is not None:
+                profile = ProfileSnapshot(self_id, profile.nickname, avatar_data_uri)
+                cached = _CachedProfile(
+                    profile, cached.nickname_updated_at, self._clock()
+                )
+                self._profiles[self_id] = cached
+                await self._persist(self_id, revision, cached)
+            return profile
+
+    async def _persist(
+        self, self_id: int, revision: int, cached: _CachedProfile
+    ) -> None:
+        if self._storage_dir is not None and (
+            cached.snapshot.nickname is not None
+            or cached.snapshot.avatar_data_uri is not None
+        ):
+            await asyncio.to_thread(self._write_profile, self_id, revision, cached)
+
+    def _write_profile(
+        self, self_id: int, revision: int, cached: _CachedProfile
+    ) -> None:
+        if self._storage_dir is None:
+            return
+        temporary: str | None = None
+        try:
+            with self._storage_lock:
+                if self._revisions.get(self_id) != revision:
+                    return
+                payload = {
+                    "_schema_version": 1,
+                    "self_id": self_id,
+                    "nickname": cached.snapshot.nickname,
+                    "avatar_data_uri": cached.snapshot.avatar_data_uri,
+                    "nickname_updated_at": cached.nickname_updated_at,
+                    "avatar_updated_at": cached.avatar_updated_at,
+                }
+                if _validated_cached_profile(payload, self_id) is None:
+                    raise ValueError("invalid profile cache")
+                raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(
+                    "utf-8"
+                )
+                if len(raw) > MAX_PROFILE_BYTES:
+                    raise ValueError("oversized profile cache")
+                self._storage_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(
+                    prefix=f".{self_id}.", suffix=".tmp", dir=self._storage_dir
+                )
+                with os.fdopen(fd, "wb") as target:
+                    os.fchmod(target.fileno(), 0o600)
+                    target.write(raw)
+                    target.flush()
+                    os.fsync(target.fileno())
+                if self._revisions.get(self_id) != revision:
+                    return
+                os.replace(temporary, self._storage_dir / f"{self_id}.json")
+                temporary = None
+                try:
+                    parent_fd = os.open(self._storage_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(parent_fd)
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            self._report_cache_error("write")
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    def _report_cache_error(self, operation: str) -> None:
+        if self._on_cache_error is not None:
+            try:
+                self._on_cache_error(operation)
+            except Exception:
+                pass
 
     async def _get_avatar(self, self_id: int) -> str | None:
-        now = self._clock()
-        cached = self._avatars.get(self_id)
-        if cached is not None and cached[0] > now:
-            return cached[1]
-
-        result: Any = None
+        future: asyncio.Future[Any] | None = None
         try:
-            if self._avatar_fetcher is not None:
-                result = await asyncio.wait_for(
-                    self._avatar_fetcher(self_id), timeout=self._avatar_timeout
-                )
-            else:
-                result = await asyncio.wait_for(
-                    self._fetch_remote_avatar(self_id), timeout=self._avatar_timeout
-                )
+            fetcher = self._avatar_fetcher or self._fetch_remote_avatar
+            future = asyncio.ensure_future(fetcher(self_id))
+            future.add_done_callback(self._discard_avatar_result)
+            # Keep cancellation of this update independent of a fetcher that
+            # swallows CancelledError; a replaced connection must still stop.
+            result = await asyncio.wait_for(
+                asyncio.shield(future), timeout=self._avatar_timeout
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            result = None
+            return None
+        finally:
+            if future is not None and not future.done():
+                future.cancel()
+        return _avatar_result_to_data_uri(result)
 
-        avatar_data_uri = _avatar_result_to_data_uri(result)
-        self._avatars[self_id] = (now + self._avatar_ttl, avatar_data_uri)
-        return avatar_data_uri
+    @staticmethod
+    def _discard_avatar_result(future: asyncio.Future[Any]) -> None:
+        """Consume late results from timed-out or cancelled avatar requests."""
+        if not future.cancelled():
+            future.exception()
 
     async def _fetch_remote_avatar(self, self_id: int) -> tuple[str, bytes] | None:
         timeout = aiohttp.ClientTimeout(total=self._avatar_timeout)
@@ -135,6 +328,58 @@ class ProfileCache:
                 if _detect_image_type(data) is None:
                     return None
                 return response.headers.get("Content-Type", ""), data
+
+
+def _valid_self_id(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_fresh(updated_at: float | None, now: float, ttl: float) -> bool:
+    return updated_at is not None and 0 <= now - updated_at < ttl
+
+
+def _valid_timestamp(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def _validated_cached_profile(payload: Any, self_id: int) -> _CachedProfile | None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "_schema_version",
+        "self_id",
+        "nickname",
+        "avatar_data_uri",
+        "nickname_updated_at",
+        "avatar_updated_at",
+    }:
+        return None
+    if type(payload["_schema_version"]) is not int or payload["_schema_version"] != 1:
+        return None
+    if not _valid_self_id(payload["self_id"]) or payload["self_id"] != self_id:
+        return None
+    nickname = payload["nickname"]
+    avatar = payload["avatar_data_uri"]
+    nickname_at = payload["nickname_updated_at"]
+    avatar_at = payload["avatar_updated_at"]
+    if nickname is None:
+        if nickname_at is not None:
+            return None
+    elif sanitize_nickname(nickname) != nickname or not _valid_timestamp(nickname_at):
+        return None
+    if avatar is None:
+        if avatar_at is not None:
+            return None
+    elif not data_uri_is_valid(avatar) or not _valid_timestamp(avatar_at):
+        return None
+    if nickname is None and avatar is None:
+        return None
+    return _CachedProfile(
+        ProfileSnapshot(self_id, nickname, avatar), nickname_at, avatar_at
+    )
 
 
 def sanitize_nickname(value: Any) -> str | None:
@@ -244,7 +489,11 @@ def _is_complete_webp(data: bytes) -> bool:
 
 def data_uri_is_valid(value: Any) -> bool:
     """Validate only local image data URIs accepted by the template."""
-    if not isinstance(value, str) or ";base64," not in value:
+    if (
+        not isinstance(value, str)
+        or len(value) > 32 + 4 * ((MAX_AVATAR_BYTES + 2) // 3)
+        or ";base64," not in value
+    ):
         return False
     prefix, encoded = value.split(",", 1)
     if prefix not in {
@@ -258,4 +507,9 @@ def data_uri_is_valid(value: Any) -> bool:
         data = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error):
         return False
-    return _avatar_result_to_data_uri((prefix[5:].split(";", 1)[0], data)) is not None
+    if not data or len(data) > MAX_AVATAR_BYTES:
+        return False
+    image_type = _detect_image_type(data)
+    return image_type is not None and _content_type_matches(
+        prefix[5:].split(";", 1)[0], image_type
+    )

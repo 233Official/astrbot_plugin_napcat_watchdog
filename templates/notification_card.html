@@ -329,8 +329,8 @@
 <body>
   {% set requested_variant = event_type|default('offline', true)|lower %}
   {% set variant = 'recovered' if requested_variant == 'recovered' else 'offline' %}
-  {% set default_title = '账号已恢复在线' if variant == 'recovered' else '账号连接中断' %}
-  {% set default_subtitle = '连接已经恢复，监测继续运行。' if variant == 'recovered' else '暂时无法保持在线，正在持续监测。' %}
+  {% set default_title = '监控已恢复' if variant == 'recovered' else '监控失联' %}
+  {% set default_subtitle = 'OneBot 监控连接已恢复，继续监测心跳。' if variant == 'recovered' else 'OneBot 监控连接或心跳中断，不代表账号离线。' %}
   {% set default_duration = '未记录' if variant == 'recovered' else '暂未记录' %}
   {% set nickname_input = nickname|default('', true)|string %}
   {% set nickname_display = nickname_input if nickname_input else '未命名账号' %}
@@ -355,9 +355,9 @@
       <div class="topline">
         <div class="service-meta">
           <span class="service-dot"></span>
-          <span>{{ service_name|default('NapCat', true)|e }}</span>
+          <span>{{ service_name|default('OneBot', true)|e }}</span>
         </div>
-        <span class="status-badge">{{ '连接已恢复' if variant == 'recovered' else '连接异常' }}</span>
+        <span class="status-badge">{{ '监控正常' if variant == 'recovered' else '监控失联' }}</span>
       </div>
 
       <section class="event-grid">
@@ -406,7 +406,7 @@
           <span class="metric-value">{{ event_time|default('时间未知', true)|e }}</span>
         </div>
         <div class="metric">
-          <span class="metric-label">{{ '离线时长' if variant == 'recovered' else '本次在线时长' }}</span>
+          <span class="metric-label">{{ '失联时长' if variant == 'recovered' else '本次监控正常时长' }}</span>
           <span class="metric-value">{{ duration_text|default(default_duration, true)|e }}</span>
         </div>
       </section>
@@ -416,7 +416,7 @@
       {% endif %}
 
       <footer class="footer">
-        <span class="footer-source">{{ source_label|default('NapCat Watchdog', true)|e }}</span>
+        <span class="footer-source">{{ source_label|default('OneBot Watchdog', true)|e }}</span>
         <span>脱敏事件通知</span>
       </footer>
     </div>

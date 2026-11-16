@@ -102,6 +102,7 @@ class WatchdogWSServer:
         self._event_callback: EventCallback | None = None
         self._disconnect_callback: DisconnectCallback | None = None
         self._profile_callback: ProfileCallback | None = None
+        self._profile_refresh_predicate: Callable[[int], bool] | None = None
 
         # Keyed by authenticated connection generation and echo so delayed
         # responses from a replaced connection cannot resolve a new request.
@@ -174,6 +175,40 @@ class WatchdogWSServer:
     def set_profile_callback(self, callback: ProfileCallback | None) -> None:
         """Register a callback for validated ``get_login_info`` nicknames."""
         self._profile_callback = callback
+
+    def set_profile_refresh_predicate(
+        self, predicate: Callable[[int], bool] | None
+    ) -> None:
+        """Register a freshness/cooldown predicate that claims due lookups."""
+        self._profile_refresh_predicate = predicate
+
+    def refresh_profiles(self) -> None:
+        """Schedule due refreshes for active connections without duplication."""
+        for self_id, (ws, generation) in self._connections.items():
+            self._start_profile_lookup(ws, self_id, generation)
+
+    async def wait_for_profile(self, self_id: int) -> None:
+        """Wait for the current lookup without letting the waiter cancel it."""
+        current = self._connections.get(self_id)
+        if current is None:
+            return
+        task = self._profile_tasks.get((self_id, current[1]))
+        if task is None:
+            return
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        def finished(_task: asyncio.Task[None]) -> None:
+            if not completion.done():
+                completion.set_result(None)
+
+        # Translate a lookup's cancellation to ordinary completion. Shielding
+        # that signal preserves the caller's own cancellation even when both
+        # tasks are cancelled in the same event-loop turn (Python 3.10 too).
+        task.add_done_callback(finished)
+        try:
+            await asyncio.shield(completion)
+        finally:
+            task.remove_done_callback(finished)
 
     async def update_access_token(self, new_token: str) -> None:
         """Replace the access token and close all existing connections.
@@ -361,8 +396,7 @@ class WatchdogWSServer:
 
         # Profile enrichment must never block admission or heartbeat
         # processing.  The request is sent after the connection is admitted.
-        if self._profile_callback is not None:
-            self._start_profile_lookup(ws, self_id, generation)
+        self._start_profile_lookup(ws, self_id, generation)
 
         # ---- Receive loop ----
         try:
@@ -442,10 +476,27 @@ class WatchdogWSServer:
         self_id: int,
         generation: int,
     ) -> None:
+        current = self._connections.get(self_id)
+        if (
+            self._profile_callback is None
+            or ws.closed
+            or current is None
+            or current[0] is not ws
+            or current[1] != generation
+        ):
+            return
         key = (self_id, generation)
-        previous = self._profile_tasks.pop(key, None)
+        previous = self._profile_tasks.get(key)
         if previous is not None and not previous.done():
-            previous.cancel()
+            return
+        predicate = self._profile_refresh_predicate
+        if predicate is not None:
+            try:
+                if not predicate(self_id):
+                    return
+            except Exception:
+                logger.warning("Profile refresh predicate failed; lookup skipped")
+                return
         task = asyncio.create_task(self._request_login_info(ws, self_id, generation))
         self._profile_tasks[key] = task
         task.add_done_callback(self._observe_profile_task)
@@ -474,8 +525,14 @@ class WatchdogWSServer:
                     generation,
                 )
                 return
+            current = self._connections.get(self_id)
             callback = self._profile_callback
-            if callback is not None:
+            if (
+                callback is not None
+                and current is not None
+                and current[0] is ws
+                and current[1] == generation
+            ):
                 await callback(self_id, generation, nickname)
         except asyncio.CancelledError:
             raise

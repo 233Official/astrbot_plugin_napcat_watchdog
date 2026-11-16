@@ -12,11 +12,14 @@ use at runtime.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import importlib
 import sys
 from collections.abc import Generator
 from pathlib import Path
 
+import aiohttp
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,7 +124,7 @@ class Context:
 
 class Star:
     def __init__(self, context: Context, config: object) -> None:
-        pass
+        self.context = context
 
 class StarTools:
     @staticmethod
@@ -394,3 +397,69 @@ class TestAdmissionHeartbeatOrdering:
             await asyncio.sleep(0)
         assert len(manager.calls) == 1
         assert manager.calls[0][2] == main_mod.TransitionKind.FIRST_ONLINE
+
+
+@pytest.mark.asyncio
+async def test_plugin_restart_restores_profiles_without_reconnect_lookup(
+    plugin_package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restored display data survives two plugin lifecycles without WS queries."""
+    main_mod = importlib.import_module(plugin_package)
+    astrbot_api = importlib.import_module("astrbot.api")
+    monkeypatch.setattr(main_mod.StarTools, "get_data_dir", lambda name: str(tmp_path))
+    server_factory = main_mod.WatchdogWSServer
+
+    def ephemeral_server(**kwargs):
+        kwargs["port"] = 0
+        return server_factory(**kwargs)
+
+    monkeypatch.setattr(main_mod, "WatchdogWSServer", ephemeral_server)
+    avatar = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    async def fetch_avatar(self_id: int) -> bytes:
+        return avatar
+
+    cache = main_mod.ProfileCache(
+        storage_dir=tmp_path / "profiles", avatar_fetcher=fetch_avatar
+    )
+    await cache.update(12345678, "合成监控账号")
+    machine = main_mod.StateMachine()
+    generation = machine.confirm_connection(12345678)
+    machine.on_heartbeat(12345678, generation, True)
+    main_mod.save_snapshot(
+        tmp_path / "napcat_watchdog_state.json", machine.get_snapshot()
+    )
+    machine.cancel_all_timers()
+
+    for _ in range(2):
+        config = astrbot_api.AstrBotConfig()
+        config["access_token"] = "local-profile-test"
+        config["listen_host"] = "127.0.0.1"
+        config["listen_port"] = 0
+        plugin = main_mod.NapCatWatchdogPlugin(main_mod.Context(), config)
+        try:
+            await plugin.initialize()
+            restored = plugin._get_profile(12345678)
+            assert restored.nickname == "合成监控账号"
+            assert restored.avatar_data_uri.startswith("data:image/png;base64,")
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(
+                    f"http://127.0.0.1:{plugin._ws_server.bound_port}/napcat-watchdog/ws",
+                    headers={
+                        "Authorization": "Bearer local-profile-test",
+                        "X-Self-ID": "12345678",
+                    },
+                ) as ws:
+                    await ws.send_json(
+                        {
+                            "post_type": "meta_event",
+                            "meta_event_type": "heartbeat",
+                            "status": {"online": True},
+                        }
+                    )
+                    with pytest.raises(asyncio.TimeoutError):
+                        await ws.receive(timeout=0.05)
+        finally:
+            await plugin.terminate()

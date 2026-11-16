@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import aiohttp
 import pytest
 
+from core.profile import DEFAULT_AVATAR_TTL, ProfileCache
 from core.ws_server import WatchdogWSServer
 
 TOKEN = "profile-test-token"
@@ -194,3 +196,268 @@ def test_profile_validator_rejects_mismatch_and_malformed_payloads() -> None:
         is None
     )
     assert _validated_login_nickname(json.loads("{}"), 1) is None
+
+
+@pytest.mark.asyncio
+async def test_fresh_profiles_suppress_reconnects_and_stale_profiles_refresh_once(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    generation = 0
+    disconnected = asyncio.Event()
+    heartbeat = asyncio.Event()
+
+    async def fetcher(self_id: int):
+        return b"\xff\xd8\xff\xd9"
+
+    cache = ProfileCache(
+        storage_dir=tmp_path / "profiles", avatar_fetcher=fetcher, clock=lambda: now[0]
+    )
+
+    async def profile_callback(self_id: int, generation: int, nickname: str) -> None:
+        await cache.update(self_id, nickname)
+
+    async def admission(self_id: int) -> int:
+        nonlocal generation
+        generation += 1
+        return generation
+
+    async def on_disconnect(self_id: int, generation: int) -> None:
+        disconnected.set()
+
+    async def on_event(self_id: int, generation: int, data: dict) -> None:
+        heartbeat.set()
+
+    server = await running_profile_server(profile_callback, timeout=5)
+    server.set_admission_handler(admission)
+    server.set_disconnect_callback(on_disconnect)
+    server.set_event_callback(on_event)
+    server.set_profile_refresh_predicate(cache.should_refresh)
+    headers = {"Authorization": f"Bearer {TOKEN}", "X-Self-ID": "123"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_url(server), headers=headers) as first:
+                request = await asyncio.wait_for(first.receive_json(), timeout=1)
+                await first.send_json(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"user_id": 123, "nickname": "cached"},
+                        "echo": request["echo"],
+                    }
+                )
+                await server.wait_for_profile(123)
+                assert cache.get(123).nickname == "cached"
+            await asyncio.wait_for(disconnected.wait(), timeout=1)
+            disconnected.clear()
+            async with session.ws_connect(ws_url(server), headers=headers) as second:
+                await second.send_json(
+                    {
+                        "post_type": "meta_event",
+                        "meta_event_type": "heartbeat",
+                        "status": {"online": True},
+                        "self_id": 123,
+                    }
+                )
+                await asyncio.wait_for(heartbeat.wait(), timeout=1)
+                server.refresh_profiles()
+                assert not server._profile_tasks
+                now[0] += DEFAULT_AVATAR_TTL + 1
+                server.refresh_profiles()
+                in_flight = dict(server._profile_tasks)
+                server.refresh_profiles()
+                assert len(in_flight) == 1
+                assert server._profile_tasks == in_flight
+                request = await asyncio.wait_for(second.receive_json(), timeout=1)
+                await second.send_json(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"user_id": 123, "nickname": "refreshed"},
+                        "echo": request["echo"],
+                    }
+                )
+                await server.wait_for_profile(123)
+                assert cache.get(123).nickname == "refreshed"
+            await asyncio.wait_for(disconnected.wait(), timeout=1)
+            server.refresh_profiles()
+            assert not server._profile_tasks
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_waiter_timeout_and_cancellation_leave_avatar_refresh_running() -> None:
+    avatar_started = asyncio.Event()
+    avatar_release = asyncio.Event()
+
+    async def fetcher(self_id: int):
+        avatar_started.set()
+        await avatar_release.wait()
+        return b"\xff\xd8\xff\xd9"
+
+    cache = ProfileCache(avatar_fetcher=fetcher, avatar_timeout=5)
+
+    async def profile_callback(self_id: int, generation: int, nickname: str) -> None:
+        await cache.update(self_id, nickname)
+
+    server = await running_profile_server(profile_callback, timeout=5)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                ws_url(server),
+                headers={"Authorization": f"Bearer {TOKEN}", "X-Self-ID": "123"},
+            ) as ws:
+                request = await asyncio.wait_for(ws.receive_json(), timeout=1)
+                await ws.send_json(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {"user_id": 123, "nickname": "visible early"},
+                        "echo": request["echo"],
+                    }
+                )
+                await asyncio.wait_for(avatar_started.wait(), timeout=1)
+                assert cache.get(123).nickname == "visible early"
+                assert cache.get(123).avatar_data_uri is None
+                refresh = server._profile_tasks[(123, 1)]
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(server.wait_for_profile(123), timeout=0.01)
+                assert not refresh.done()
+                waiter = asyncio.create_task(server.wait_for_profile(123))
+                await asyncio.sleep(0)
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+                assert not refresh.done()
+                avatar_release.set()
+                await asyncio.wait_for(server.wait_for_profile(123), timeout=1)
+                assert cache.get(123).avatar_data_uri is not None
+                assert not server._profile_tasks
+    finally:
+        avatar_release.set()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_waiters_follow_generation_through_cancellation() -> None:
+    profiles: list[tuple[int, str]] = []
+    generation = 0
+
+    async def profile_callback(self_id: int, generation: int, nickname: str) -> None:
+        profiles.append((generation, nickname))
+
+    async def admission(self_id: int) -> int:
+        nonlocal generation
+        generation += 1
+        return generation
+
+    server = await running_profile_server(profile_callback, timeout=5)
+    server.set_admission_handler(admission)
+    headers = {"Authorization": f"Bearer {TOKEN}", "X-Self-ID": "123"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_url(server), headers=headers) as first:
+                old_request = await asyncio.wait_for(first.receive_json(), timeout=1)
+                old_waiter = asyncio.create_task(server.wait_for_profile(123))
+                await asyncio.sleep(0)
+                async with session.ws_connect(
+                    ws_url(server), headers=headers
+                ) as second:
+                    request = await asyncio.wait_for(second.receive_json(), timeout=1)
+                    await asyncio.wait_for(old_waiter, timeout=1)
+                    waiter = asyncio.create_task(server.wait_for_profile(123))
+                    await asyncio.sleep(0)
+                    await second.send_json(
+                        {
+                            "status": "ok",
+                            "retcode": 0,
+                            "data": {"user_id": 123, "nickname": "stale"},
+                            "echo": old_request["echo"],
+                        }
+                    )
+                    await second.send_json(
+                        {
+                            "status": "ok",
+                            "retcode": 0,
+                            "data": {"user_id": 123, "nickname": "current"},
+                            "echo": request["echo"],
+                        }
+                    )
+                    await asyncio.wait_for(waiter, timeout=1)
+                    assert profiles == [(2, "current")]
+                    server.refresh_profiles()
+                    await asyncio.wait_for(second.receive_json(), timeout=1)
+                    disconnected_waiter = asyncio.create_task(
+                        server.wait_for_profile(123)
+                    )
+                    await asyncio.sleep(0)
+                    await second.close()
+                    await asyncio.wait_for(disconnected_waiter, timeout=1)
+                    assert not server._pending_actions
+                    assert not server._profile_tasks
+        await server.wait_for_profile(123)
+        await server.wait_for_profile(999)
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_response_resolved_during_replacement_never_publishes_stale_profile() -> (
+    None
+):
+    profiles: list[str] = []
+    server = WatchdogWSServer(access_token=TOKEN)
+
+    async def callback(self_id: int, generation: int, nickname: str) -> None:
+        profiles.append(nickname)
+
+    class ReplacingSocket:
+        closed = False
+
+        async def send_json(self, request: dict) -> None:
+            # Resolve the old echo, then replace the connection before the
+            # request task resumes from its response wait.
+            server._resolve_action_response(
+                123,
+                1,
+                {
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {"user_id": 123, "nickname": "stale"},
+                    "echo": request["echo"],
+                },
+            )
+            server._connections[123] = (replacement, 2)
+
+    original = ReplacingSocket()
+    replacement = ReplacingSocket()
+    server.set_profile_callback(callback)
+    server._connections[123] = (original, 1)
+    server.refresh_profiles()
+    await server.wait_for_profile(123)
+    assert profiles == []
+    assert not server._pending_actions
+    assert not server._profile_tasks
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_is_preserved_when_refresh_is_also_cancelled() -> (
+    None
+):
+    server = WatchdogWSServer(access_token=TOKEN)
+    release = asyncio.Event()
+    refresh = asyncio.create_task(release.wait())
+    server._connections[123] = (object(), 1)
+    server._profile_tasks[(123, 1)] = refresh
+    waiter = asyncio.create_task(server.wait_for_profile(123))
+    try:
+        await asyncio.sleep(0)
+        refresh.cancel()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    finally:
+        refresh.cancel()
+        waiter.cancel()
+        await asyncio.gather(refresh, waiter, return_exceptions=True)

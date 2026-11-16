@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NapCat Watchdog 通知卡片预览</title>
+  <title>OneBot Watchdog 通知卡片预览</title>
   <style>
     * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; }
@@ -48,24 +48,24 @@
 </head>
 <body>
   <main class="preview-stack">
-    <p class="preview-label">离线示例</p>
+    <p class="preview-label">监控失联示例</p>
     <article class="notification-card offline">
       <div class="accent-line"></div>
       <div class="card-body">
-        <div class="topline"><div class="service-meta"><span class="service-dot"></span><span>NapCat</span></div><span class="status-badge">连接异常</span></div>
+        <div class="topline"><div class="service-meta"><span class="service-dot"></span><span>OneBot</span></div><span class="status-badge">监控失联</span></div>
         <section class="event-grid">
           <div class="event-summary">
             <div class="status-icon"><svg viewBox="0 0 48 48" fill="none"><path d="M24 7.5L42 39H6L24 7.5Z" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/><path d="M24 18V27" stroke="currentColor" stroke-width="3.6" stroke-linecap="round"/><circle cx="24" cy="33" r="2" fill="currentColor"/></svg></div>
-            <div><h1 class="title">账号连接中断</h1><p class="subtitle">暂时无法保持在线，正在持续监测。</p></div>
+            <div><h1 class="title">监控失联</h1><p class="subtitle">OneBot 监控连接或心跳中断，不代表账号离线。</p></div>
           </div>
           <div class="account-block">
             <div class="avatar"><span>林</span></div>
             <div class="account-copy"><p class="nickname">林间小站</p><span class="account-number">12****34</span><span class="instance-label">主实例</span></div>
           </div>
         </section>
-        <section class="metrics"><div class="metric"><span class="metric-label">发生时间</span><span class="metric-value">2026-07-25 14:32</span></div><div class="metric"><span class="metric-label">本次在线时长</span><span class="metric-value">3天 6小时 12分钟</span></div></section>
+        <section class="metrics"><div class="metric"><span class="metric-label">发生时间</span><span class="metric-value">2026-07-25 14:32</span></div><div class="metric"><span class="metric-label">本次监控正常时长</span><span class="metric-value">3天 6小时 12分钟</span></div></section>
         <div class="reason-note"><strong>状态说明</strong>　心跳响应超时</div>
-        <footer class="footer"><span class="footer-source">NapCat Watchdog</span><span>脱敏事件通知</span></footer>
+        <footer class="footer"><span class="footer-source">OneBot Watchdog</span><span>脱敏事件通知</span></footer>
       </div>
     </article>
 
@@ -73,19 +73,19 @@
     <article class="notification-card recovered">
       <div class="accent-line"></div>
       <div class="card-body">
-        <div class="topline"><div class="service-meta"><span class="service-dot"></span><span>NapCat</span></div><span class="status-badge">连接已恢复</span></div>
+        <div class="topline"><div class="service-meta"><span class="service-dot"></span><span>OneBot</span></div><span class="status-badge">监控正常</span></div>
         <section class="event-grid">
           <div class="event-summary">
             <div class="status-icon"><svg viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="17" stroke="currentColor" stroke-width="3.4"/><path d="M15.5 24.5L21.2 30L32.8 18.2" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-            <div><h1 class="title">账号已恢复在线</h1><p class="subtitle">连接已经恢复，监测继续运行。</p></div>
+            <div><h1 class="title">监控已恢复</h1><p class="subtitle">OneBot 监控连接已恢复，继续监测心跳。</p></div>
           </div>
           <div class="account-block">
             <div class="avatar"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAC5ElEQVR42u1az28SQRT+GH5JqSamejImYsMPA2u09dAaTy1eatuDd2+ePPonGOPNkxdj4h9gYiJUW+PNxKgHKA1bBMUAiQgtlVikLZhUwMM2hAhsF3Z2d7buHMgGHu9938w3M/tmnmn8yT3ouRHovBkEDAIGAZ03ixJOa7lCv59GXGcYJSACup8ZFTIW1aD3+6NMGhZNoFOkYdEQOhUahAX0cjwTdtAP558whX6IKIQ19IPGIgyiHygiYRO99LiEWfQSox/1t1Ftu18KhiM9Aix0/6FIju4IsNP94njoJDTFB4/bz6F45M6zp+L2z2/fvXreIzwnN74HH91nKCe+fuGi3WIVMTg9emLK5WYxqa/U9wA4bfYZr1/EbM5/mZhM5d0dBQkMNwGKle3UZgHAIndFxGyemwDwJhWnMg0oS2jl0xqAoI87Zu2tolOjx6fOuQEsJ2IsngsJBJw2+4wn0NPghn/CTEj1d+199guLBFKbhUy5BGCRmxTRz+tkfL/RYPRkbomP9lNRWz8v+VV2jxbDfBTAiM0+6w10rz9mQir1vXeZFLsE0lsbn0tFAAtda9F8YBLASmKNln6UehcKxSMAgt6Aw2rr1M+0yw0gxEdZP50WCPyjIkE/P3arH3NpxQnIPK/8tl2O5XMAFjrWIkE/r9ZjjWZzOLc9USn1On2gIh8nqGjMeaCfF/GIPi44ltajzVbLYbUFfRyAOf8lMyGFys/VfFYfBLZ2qh+y6baKhM8wH221WioRkH/7EOIjAGa9gbMnx6ZdnvY3FCeAsinlciK23/jjsNoe3rxlJiRTLiWKeVWTepmD8Ktee/s1CeDauK89rel2v+JJfeeaE6a6f7Wb6dBiD82ze3Eh/AcX3dRvdil2v9QR0IqDlLiEoi/10Q82B9TkID0WUcivOuiHWYWU5jCof6JCDEU9W+REorjHqV0rQZGGltUqMmmwUi/UjUaXFVta7RhG1aJBwCCg8/YXc7kZtCJ6ytsAAAAASUVORK5CYII=" alt=""></div>
             <div class="account-copy"><p class="nickname">Mori</p><span class="account-number">98****21</span><span class="instance-label">备用实例</span></div>
           </div>
         </section>
-        <section class="metrics"><div class="metric"><span class="metric-label">恢复时间</span><span class="metric-value">2026-07-25 14:38</span></div><div class="metric"><span class="metric-label">离线时长</span><span class="metric-value">6 分钟</span></div></section>
-        <footer class="footer"><span class="footer-source">NapCat Watchdog</span><span>脱敏事件通知</span></footer>
+        <section class="metrics"><div class="metric"><span class="metric-label">恢复时间</span><span class="metric-value">2026-07-25 14:38</span></div><div class="metric"><span class="metric-label">失联时长</span><span class="metric-value">6 分钟</span></div></section>
+        <footer class="footer"><span class="footer-source">OneBot Watchdog</span><span>脱敏事件通知</span></footer>
       </div>
     </article>
   </main>

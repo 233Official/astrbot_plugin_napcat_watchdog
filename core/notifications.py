@@ -19,7 +19,7 @@ import math
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -391,6 +391,8 @@ class NotificationManager:
         max_attempts: int = _MAX_ATTEMPTS,
         wall_clock: Callable[[], float] = time.time,
         profile_provider: Callable[[int], Any] | None = None,
+        profile_waiter: Callable[[int], Awaitable[Any]] | None = None,
+        profile_wait_timeout: float = 3.0,
         instance_label: str | None = None,
     ) -> None:
         self.context = context
@@ -404,6 +406,8 @@ class NotificationManager:
         self.max_attempts = max(1, min(int(max_attempts), _MAX_ATTEMPTS))
         self.wall_clock = wall_clock
         self.profile_provider = profile_provider
+        self.profile_waiter = profile_waiter
+        self.profile_wait_timeout = max(0.0, float(profile_wait_timeout))
         self.instance_label = instance_label
 
     @property
@@ -612,6 +616,25 @@ class NotificationManager:
         duration_seconds: float | None,
     ) -> Any | None:
         nickname, avatar_data_uri = self._profile_values(self_id)
+        if (
+            event_type == "recovered"
+            and not nickname
+            and not avatar_data_uri
+            and callable(self.profile_waiter)
+            and self.profile_wait_timeout > 0
+        ):
+            try:
+                # The connection owns this refresh: neither a card deadline
+                # nor cancellation of its delivery may cancel the lookup.
+                await asyncio.wait_for(
+                    asyncio.shield(self.profile_waiter(self_id)),
+                    timeout=self.profile_wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                logger.debug("OneBot notification profile wait failed", exc_info=True)
+            nickname, avatar_data_uri = self._profile_values(self_id)
         data = _template_data(
             self_id=self_id,
             event_type=event_type,
@@ -800,20 +823,20 @@ def _template_data(
     recovered = event_type == "recovered"
     data: dict[str, Any] = {
         "event_type": event_type,
-        "service_name": "NapCat",
+        "service_name": "OneBot",
         "nickname": sanitize_nickname(nickname),
         "avatar_data_uri": _safe_avatar_data_uri(avatar_data_uri),
         "instance_label": sanitize_nickname(instance_label),
         "masked_qq": _mask_qq(self_id),
-        "title": "账号已恢复在线" if recovered else "账号连接中断",
+        "title": "监控已恢复" if recovered else "监控失联",
         "subtitle": (
-            "连接已经恢复，监测继续运行。"
+            "OneBot 监控连接已恢复，继续监测心跳。"
             if recovered
-            else "暂时无法保持在线，正在持续监测。"
+            else "OneBot 监控连接或心跳中断，不代表账号离线。"
         ),
         "event_time": _format_time(event_time),
-        "safe_reason_label": "已恢复在线" if recovered else "确认离线",
-        "source_label": "NapCat Watchdog",
+        "safe_reason_label": "监控连接正常" if recovered else "监控连接或心跳超时",
+        "source_label": "OneBot Watchdog",
     }
     if _is_finite_nonnegative(duration_seconds):
         data["duration_text"] = _format_duration(duration_seconds)
@@ -826,7 +849,9 @@ def _plain_text(
     include_owner: bool,
     nickname: str | None = None,
 ) -> str:
-    status = "NapCat 掉线" if pending.event_type == "offline" else "NapCat 上线"
+    status = (
+        "OneBot 监控失联" if pending.event_type == "offline" else "OneBot 监控已恢复"
+    )
     text = (
         f"{'⚠️' if include_owner else '✅'} {status}\n"
         f"QQ：{_mask_qq(pending.self_id)}\n"
@@ -837,7 +862,7 @@ def _plain_text(
         text += f"\n账号：{safe_nickname}"
     if _is_finite_nonnegative(pending.duration_seconds):
         duration_label = (
-            "离线时长" if pending.event_type == "recovered" else "本次在线时长"
+            "失联时长" if pending.event_type == "recovered" else "本次监控正常时长"
         )
         text += f"\n{duration_label}：{_format_duration(pending.duration_seconds)}"
     if include_owner:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import sys
@@ -11,11 +12,13 @@ from typing import Any
 
 import pytest
 
+from core.duration import format_natural_duration
 from core.notifications import (
     _MAX_DEDUPE_IDS,
     NotificationManager,
     PendingNotification,
     PendingNotificationStore,
+    _format_time,
 )
 from core.state_machine import QQStatus, TransitionKind
 from core.subscriptions import SubscriptionStore
@@ -79,6 +82,9 @@ def make_manager(
     context: FakeContext,
     *,
     html_render: Any = None,
+    profile_provider: Any = None,
+    profile_waiter: Any = None,
+    profile_wait_timeout: float = 3.0,
 ) -> tuple[NotificationManager, SubscriptionStore, Path]:
     subscriptions = SubscriptionStore(wall_clock=lambda: 1000.0)
     pending_path = tmp_path / "pending_notifications.json"
@@ -87,6 +93,9 @@ def make_manager(
         subscriptions,
         pending_path,
         html_render=html_render,
+        profile_provider=profile_provider,
+        profile_waiter=profile_waiter,
+        profile_wait_timeout=profile_wait_timeout,
     )
     return manager, subscriptions, pending_path
 
@@ -343,6 +352,373 @@ async def test_remote_avatar_url_is_rejected_and_missing_profile_is_safe(
     assert captured["nickname"] == "昵称不应换行"
     assert captured["avatar_data_uri"] is None
     assert "qlogo.cn" not in str(captured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", [TransitionKind.FIRST_ONLINE, TransitionKind.RECOVERED]
+)
+async def test_cold_recovery_waits_for_profile_and_rereads_cache_before_one_render(
+    tmp_path: Path, astrbot_components: None, kind: TransitionKind
+) -> None:
+    context = FakeContext()
+    profile: dict[str, Any] = {
+        "nickname": " \n ",
+        "avatar_data_uri": "https://example.invalid/avatar.png",
+    }
+    waiter_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+    captured: list[dict[str, Any]] = []
+    waiter_calls: list[int] = []
+    avatar = "data:image/png;base64," + base64.b64encode(_PNG).decode("ascii")
+
+    async def refresh() -> dict[str, str]:
+        await release_refresh.wait()
+        profile.update(nickname="恢复后的昵称", avatar_data_uri=avatar)
+        return {"nickname": "不能直接作为渲染数据的返回值"}
+
+    refresh_task = asyncio.create_task(refresh())
+
+    def wait_for_profile(self_id: int) -> asyncio.Task[dict[str, str]]:
+        waiter_calls.append(self_id)
+        waiter_started.set()
+        return refresh_task
+
+    async def render(template: str, data: dict[str, Any], **kwargs: Any) -> bytes:
+        captured.append(data)
+        waiter_started.set()
+        return _PNG
+
+    manager, subscriptions, _ = make_manager(
+        tmp_path,
+        context,
+        html_render=render,
+        profile_provider=lambda self_id: profile,
+        profile_waiter=wait_for_profile,
+    )
+    subscriptions.subscribe("qq:GroupMessage:1", "owner-a")
+    subscriptions.subscribe("qq:GroupMessage:2", "owner-b")
+    offline_since = 880.0 if kind == TransitionKind.RECOVERED else None
+    notification = asyncio.create_task(
+        manager.handle_transition(
+            123456,
+            QQStatus.ONLINE,
+            kind,
+            event_time=1000.0,
+            offline_since=offline_since,
+            episode_id=7,
+        )
+    )
+    try:
+        await waiter_started.wait()
+        assert waiter_calls == [123456]
+        assert captured == []
+        assert context.calls == []
+        await manager.handle_transition(
+            123456, QQStatus.ONLINE, kind, event_time=2000.0, episode_id=7
+        )
+        assert waiter_calls == [123456]
+        manager.wall_clock = lambda: 9000.0
+        release_refresh.set()
+        await notification
+    finally:
+        release_refresh.set()
+        await asyncio.gather(notification, refresh_task, return_exceptions=True)
+
+    assert len(captured) == 1
+    assert captured[0]["nickname"] == "恢复后的昵称"
+    assert captured[0]["avatar_data_uri"] == avatar
+    assert captured[0]["event_time"] == _format_time(1000.0)
+    if offline_since is None:
+        assert "duration_text" not in captured[0]
+    else:
+        assert captured[0]["duration_text"] == format_natural_duration(120.0)
+    assert [umo for umo, _ in context.calls] == [
+        "qq:GroupMessage:1",
+        "qq:GroupMessage:2",
+    ]
+    assert all(len(chain.chain) == 1 for _, chain in context.calls)
+    assert all(isinstance(chain.chain[0], FakeImage) for _, chain in context.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_nickname", [None, "已取得的昵称"])
+async def test_cold_recovery_timeout_rereads_partial_cache_and_keeps_refresh_alive(
+    tmp_path: Path, astrbot_components: None, partial_nickname: str | None
+) -> None:
+    context = FakeContext()
+    profile: dict[str, Any] = {}
+    start_refresh = asyncio.Event()
+    release_refresh = asyncio.Event()
+    captured: list[dict[str, Any]] = []
+    waiter_calls: list[int] = []
+    avatar = "data:image/png;base64," + base64.b64encode(_PNG).decode("ascii")
+
+    async def refresh() -> None:
+        await start_refresh.wait()
+        if partial_nickname:
+            profile["nickname"] = partial_nickname
+        await release_refresh.wait()
+        profile.update(nickname="完整资料", avatar_data_uri=avatar)
+
+    refresh_task = asyncio.create_task(refresh())
+
+    def wait_for_profile(self_id: int) -> asyncio.Task[None]:
+        waiter_calls.append(self_id)
+        start_refresh.set()
+        return refresh_task
+
+    async def render(template: str, data: dict[str, Any], **kwargs: Any) -> bytes:
+        captured.append(data)
+        return _PNG
+
+    manager, subscriptions, _ = make_manager(
+        tmp_path,
+        context,
+        html_render=render,
+        profile_provider=lambda self_id: profile,
+        profile_waiter=wait_for_profile,
+        profile_wait_timeout=0.01,
+    )
+    subscriptions.subscribe("qq:GroupMessage:1", "owner-a")
+    try:
+        await manager.handle_transition(
+            123456,
+            QQStatus.ONLINE,
+            TransitionKind.RECOVERED,
+            event_time=1000.0,
+            episode_id=7,
+        )
+        assert waiter_calls == [123456]
+        assert not refresh_task.done()
+        assert len(context.calls) == 1
+        assert len(context.calls[0][1].chain) == 1
+        assert isinstance(context.calls[0][1].chain[0], FakeImage)
+        assert captured[0]["nickname"] == partial_nickname
+        assert captured[0]["avatar_data_uri"] is None
+    finally:
+        start_refresh.set()
+        release_refresh.set()
+        await refresh_task
+
+    await manager.handle_transition(
+        123456,
+        QQStatus.ONLINE,
+        TransitionKind.RECOVERED,
+        event_time=2000.0,
+        episode_id=7,
+    )
+    assert len(context.calls) == 1
+    await manager.handle_transition(
+        123456,
+        QQStatus.ONLINE,
+        TransitionKind.RECOVERED,
+        event_time=3000.0,
+        episode_id=8,
+    )
+    assert len(context.calls) == 2
+    assert waiter_calls == [123456]
+    assert captured[1]["nickname"] == "完整资料"
+    assert captured[1]["avatar_data_uri"] == avatar
+
+
+@pytest.mark.asyncio
+async def test_cold_recovery_cancellation_does_not_cancel_background_refresh(
+    tmp_path: Path, astrbot_components: None
+) -> None:
+    context = FakeContext()
+    profile: dict[str, Any] = {}
+    waiter_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+    waiter_calls: list[int] = []
+
+    async def refresh() -> None:
+        await release_refresh.wait()
+        profile["nickname"] = "后台取得的昵称"
+
+    refresh_task = asyncio.create_task(refresh())
+
+    def wait_for_profile(self_id: int) -> asyncio.Task[None]:
+        waiter_calls.append(self_id)
+        waiter_started.set()
+        return refresh_task
+
+    async def render(template: str, data: dict[str, Any], **kwargs: Any) -> bytes:
+        waiter_started.set()
+        return _PNG
+
+    manager, subscriptions, _ = make_manager(
+        tmp_path,
+        context,
+        html_render=render,
+        profile_provider=lambda self_id: profile,
+        profile_waiter=wait_for_profile,
+    )
+    subscriptions.subscribe("qq:GroupMessage:1", "owner-a")
+    notification = asyncio.create_task(
+        manager.handle_transition(
+            123456,
+            QQStatus.ONLINE,
+            TransitionKind.FIRST_ONLINE,
+            event_time=1000.0,
+            episode_id=7,
+        )
+    )
+    try:
+        await waiter_started.wait()
+        assert waiter_calls == [123456]
+        notification.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await notification
+        assert not refresh_task.done()
+        assert context.calls == []
+    finally:
+        release_refresh.set()
+        await asyncio.gather(notification, refresh_task, return_exceptions=True)
+
+    assert profile["nickname"] == "后台取得的昵称"
+    await manager.handle_transition(
+        123456,
+        QQStatus.ONLINE,
+        TransitionKind.RECOVERED,
+        event_time=2000.0,
+        episode_id=8,
+    )
+    assert waiter_calls == [123456]
+    assert len(context.calls) == 1
+    assert len(context.calls[0][1].chain) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_nickname", [None, "部分成功的昵称"])
+async def test_cold_recovery_wait_failure_uses_latest_cache_for_text_fallback(
+    tmp_path: Path, astrbot_components: None, partial_nickname: str | None
+) -> None:
+    context = FakeContext()
+    profile: dict[str, Any] = {}
+    captured: dict[str, Any] = {}
+
+    async def wait_for_profile(self_id: int) -> None:
+        if partial_nickname:
+            profile["nickname"] = partial_nickname
+        raise RuntimeError("profile refresh failed")
+
+    async def invalid_render(
+        template: str, data: dict[str, Any], **kwargs: Any
+    ) -> bytes:
+        captured.update(data)
+        return b"not an image"
+
+    manager, subscriptions, _ = make_manager(
+        tmp_path,
+        context,
+        html_render=invalid_render,
+        profile_provider=lambda self_id: profile,
+        profile_waiter=wait_for_profile,
+    )
+    subscriptions.subscribe("qq:GroupMessage:1", "owner-a")
+    await manager.handle_transition(
+        123456,
+        QQStatus.ONLINE,
+        TransitionKind.RECOVERED,
+        event_time=1000.0,
+    )
+
+    assert captured["nickname"] == partial_nickname
+    assert captured["avatar_data_uri"] is None
+    assert len(context.calls) == 1
+    assert len(context.calls[0][1].chain) == 1
+    assert isinstance(context.calls[0][1].chain[0], FakePlain)
+    if partial_nickname:
+        assert partial_nickname in context.calls[0][1].chain[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", [TransitionKind.FIRST_ONLINE, TransitionKind.RECOVERED]
+)
+@pytest.mark.parametrize("cached_fields", ["nickname", "avatar", "both"])
+async def test_recovery_uses_stale_cached_profile_without_waiting(
+    tmp_path: Path,
+    astrbot_components: None,
+    kind: TransitionKind,
+    cached_fields: str,
+) -> None:
+    context = FakeContext()
+    avatar = "data:image/png;base64," + base64.b64encode(_PNG).decode("ascii")
+    # Successful cached data remains usable regardless of its refresh age.
+    profile = {
+        "nickname": "历史昵称" if cached_fields in {"nickname", "both"} else None,
+        "avatar_data_uri": avatar if cached_fields in {"avatar", "both"} else None,
+    }
+    waiter_calls: list[int] = []
+    captured: dict[str, Any] = {}
+
+    async def wait_for_profile(self_id: int) -> None:
+        waiter_calls.append(self_id)
+        raise RuntimeError("cached profile must not wait")
+
+    async def render(template: str, data: dict[str, Any], **kwargs: Any) -> bytes:
+        captured.update(data)
+        return _PNG
+
+    manager, subscriptions, _ = make_manager(
+        tmp_path,
+        context,
+        html_render=render,
+        profile_provider=lambda self_id: profile,
+        profile_waiter=wait_for_profile,
+    )
+    subscriptions.subscribe("qq:GroupMessage:1", "owner-a")
+    await manager.handle_transition(123456, QQStatus.ONLINE, kind, event_time=1000.0)
+
+    assert waiter_calls == []
+    assert captured["nickname"] == profile["nickname"]
+    assert captured["avatar_data_uri"] == profile["avatar_data_uri"]
+    assert len(context.calls) == 1
+    assert len(context.calls[0][1].chain) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_cached_profile", [False, True])
+async def test_offline_never_waits_for_profile_and_keeps_owner_mention(
+    tmp_path: Path, astrbot_components: None, has_cached_profile: bool
+) -> None:
+    context = FakeContext()
+    profile = {"nickname": "历史昵称"} if has_cached_profile else None
+    waiter_calls: list[int] = []
+    captured: dict[str, Any] = {}
+
+    async def wait_for_profile(self_id: int) -> None:
+        waiter_calls.append(self_id)
+        raise RuntimeError("offline notifications must not wait")
+
+    async def render(template: str, data: dict[str, Any], **kwargs: Any) -> bytes:
+        captured.update(data)
+        return _PNG
+
+    manager, subscriptions, _ = make_manager(
+        tmp_path,
+        context,
+        html_render=render,
+        profile_provider=lambda self_id: profile,
+        profile_waiter=wait_for_profile,
+    )
+    subscriptions.subscribe("qq:GroupMessage:1", "owner-a")
+    await manager.handle_transition(
+        123456,
+        QQStatus.OFFLINE,
+        TransitionKind.OFFLINE_TIMEOUT,
+        event_time=1000.0,
+        online_since=880.0,
+    )
+
+    assert waiter_calls == []
+    assert captured["nickname"] == ("历史昵称" if has_cached_profile else None)
+    assert captured["duration_text"] == format_natural_duration(120.0)
+    assert len(context.calls) == 1
+    assert isinstance(context.calls[0][1].chain[0], FakeImage)
+    assert context.calls[0][1].chain[1].qq == "owner-a"
 
 
 @pytest.mark.asyncio

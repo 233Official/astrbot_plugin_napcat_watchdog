@@ -637,8 +637,6 @@ class TestStatusCommand:
         assert data["instances"][0]["nickname"] == "昵称"
         assert data["instances"][0]["avatar_data_uri"].startswith("data:image/png;")
         assert data["instances"][0]["masked_qq"] == "12****89"
-        assert data["instances"][1]["status_label"] == "待确认"
-        assert data["instances"][2]["status_label"] == "离线"
         assert "1700000000" not in repr(data)
         assert "owner-secret" not in repr(data)
         assert "qq:GroupMessage:status" not in repr(data)

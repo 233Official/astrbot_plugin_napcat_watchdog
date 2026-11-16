@@ -500,7 +500,7 @@
     <div class="dashboard-body">
       <header class="header">
         <div>
-          <h1 class="title">NapCat 监控状态</h1>
+          <h1 class="title">OneBot 监控状态</h1>
           <p class="updated-at">更新于 {{ updated_at|default('时间未知', true)|e }}</p>
         </div>
         <span class="service-badge">{{ '运行中' if service_is_running else '未运行' }}</span>
@@ -526,9 +526,9 @@
           </div>
         </div>
         <div class="health-strip" aria-label="实例状态统计">
-          <span class="health-chip online">在线 <strong>{{ online_count|default(0, true)|e }}</strong></span>
+          <span class="health-chip online">监控正常 <strong>{{ online_count|default(0, true)|e }}</strong></span>
           <span class="health-chip pending">待确认 <strong>{{ pending_count|default(0, true)|e }}</strong></span>
-          <span class="health-chip offline">离线 <strong>{{ offline_count|default(0, true)|e }}</strong></span>
+          <span class="health-chip offline">监控失联 <strong>{{ offline_count|default(0, true)|e }}</strong></span>
         </div>
       </section>
 
@@ -558,16 +558,16 @@
             {% set raw_status = instance.status|default('offline', true)|lower %}
             {% if raw_status == 'online' %}
               {% set row_tone = 'online' %}
-              {% set default_status_label = '在线' %}
-              {% set default_duration_label = '在线时长' %}
+              {% set default_status_label = '监控正常' %}
+              {% set default_duration_label = '监控正常时长' %}
             {% elif raw_status == 'pending_offline' %}
               {% set row_tone = 'pending' %}
               {% set default_status_label = '待确认' %}
               {% set default_duration_label = '待确认时长' %}
             {% else %}
               {% set row_tone = 'offline' %}
-              {% set default_status_label = '离线' %}
-              {% set default_duration_label = '离线时长' %}
+              {% set default_status_label = '监控失联' %}
+              {% set default_duration_label = '失联时长' %}
             {% endif %}
             {% set nickname_input = instance.nickname|default('', true)|string %}
             {% set nickname_display = nickname_input if nickname_input else '未命名账号' %}
@@ -627,7 +627,7 @@
       </section>
 
       <footer class="footer">
-        <strong>NapCat Watchdog</strong>
+        <strong>OneBot Watchdog</strong>
         <span>仅展示脱敏账号信息</span>
       </footer>
     </div>
