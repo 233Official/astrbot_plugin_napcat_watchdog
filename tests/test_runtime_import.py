@@ -15,7 +15,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
+import json
 import sys
+import time
+import types
 from collections.abc import Generator
 from pathlib import Path
 
@@ -463,3 +466,153 @@ async def test_plugin_restart_restores_profiles_without_reconnect_lookup(
                         await ws.receive(timeout=0.05)
         finally:
             await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_backlog_without_rendering_or_spending_attempts(
+    plugin_package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real plugin startup is quiet even with fresh and exhausted v2 entries."""
+    main_mod = importlib.import_module(plugin_package)
+    astrbot_api = importlib.import_module("astrbot.api")
+    monkeypatch.setattr(main_mod.StarTools, "get_data_dir", lambda name: str(tmp_path))
+    server_factory = main_mod.WatchdogWSServer
+
+    def ephemeral_server(**kwargs):
+        kwargs["port"] = 0
+        return server_factory(**kwargs)
+
+    monkeypatch.setattr(main_mod, "WatchdogWSServer", ephemeral_server)
+    subscriptions = main_mod.SubscriptionStore()
+    subscriptions.subscribe("qq:GroupMessage:local-test", "owner")
+    subscriptions.save(tmp_path / "subscriptions.json")
+    machine = main_mod.StateMachine()
+    entries = {}
+    for self_id, attempts in ((12345678, 3), (23456789, 0)):
+        generation = machine.confirm_connection(self_id)
+        machine.on_heartbeat(self_id, generation, True)
+        machine.force_offline(self_id)
+        event_id = f"local-offline:{self_id}"
+        entries[event_id] = {
+            "event_id": event_id,
+            "self_id": self_id,
+            "event_type": "offline",
+            "event_time": time.time(),
+            "duration_seconds": None,
+            "umo": "qq:GroupMessage:local-test",
+            "owner_id": "owner",
+            "attempts": attempts,
+            "episode_id": 1,
+        }
+    main_mod.save_snapshot(
+        tmp_path / "napcat_watchdog_state.json", machine.get_snapshot()
+    )
+    machine.cancel_all_timers()
+    pending_path = tmp_path / "pending_notifications.json"
+    pending_path.write_text(
+        json.dumps(
+            {"_schema_version": 2, "pending": entries, "seen": [], "completed": []}
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+    rendered = []
+
+    async def send_message(umo, chain):
+        calls.append(umo)
+        return True
+
+    async def render(*args, **kwargs):
+        rendered.append(args)
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+
+    context = main_mod.Context()
+    context.send_message = send_message
+    config = astrbot_api.AstrBotConfig()
+    config["access_token"] = "local-quiet-start-test"
+    config["listen_host"] = "127.0.0.1"
+    plugin = main_mod.NapCatWatchdogPlugin(context, config)
+    plugin.html_render = render
+    try:
+        await plugin.initialize()
+        assert calls == []
+        assert rendered == []
+        stored = json.loads(pending_path.read_text(encoding="utf-8"))
+        assert stored["_schema_version"] == 3
+        assert {
+            item["self_id"]: item["attempts"] for item in stored["pending"].values()
+        } == {12345678: 3, 23456789: 0}
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mute_until", "role", "all_muted", "expected"),
+    [
+        (0, "member", False, True),
+        (4_102_444_800, "member", False, False),
+        (None, "member", False, False),
+        (0, "member", True, False),
+        (0, "member", None, False),
+        (0, "admin", None, True),
+    ],
+)
+async def test_notification_preflight_checks_current_sender_membership_and_mute(
+    plugin_package: str, mute_until, role, all_muted, expected: bool
+) -> None:
+    main_mod = importlib.import_module(plugin_package)
+    astrbot_api = importlib.import_module("astrbot.api")
+    calls = []
+    requested_platforms = []
+
+    async def action(name, **params):
+        calls.append((name, params))
+        if name == "get_login_info":
+            return {"user_id": 123}
+        if name == "get_group_member_info":
+            return {
+                "user_id": 123,
+                "group_id": 456,
+                "role": role,
+                "shut_up_timestamp": mute_until,
+            }
+        if name == "get_group_info":
+            return {"group_id": 456, "group_all_shut": all_muted}
+        raise AssertionError("Unexpected preflight action")
+
+    client = types.SimpleNamespace(api=types.SimpleNamespace(call_action=action))
+    platform = types.SimpleNamespace(
+        meta=lambda: types.SimpleNamespace(name="aiocqhttp"),
+        get_client=lambda: client,
+    )
+
+    def get_platform(platform_id):
+        requested_platforms.append(platform_id)
+        return platform if platform_id == "bot-a" else None
+
+    context = main_mod.Context()
+    context.get_platform_inst = get_platform
+    plugin = main_mod.NapCatWatchdogPlugin(context, astrbot_api.AstrBotConfig())
+    assert await plugin._notification_target_ready("bot-a:GroupMessage:456") is expected
+    assert requested_platforms == ["bot-a"]
+    assert all(params.get("group_id", 456) == 456 for _, params in calls)
+    assert all(params.get("user_id", 123) == 123 for _, params in calls)
+
+
+@pytest.mark.asyncio
+async def test_notification_preflight_never_borrows_another_platform(
+    plugin_package: str,
+) -> None:
+    main_mod = importlib.import_module(plugin_package)
+    astrbot_api = importlib.import_module("astrbot.api")
+    requested = []
+    context = main_mod.Context()
+    context.get_platform_inst = lambda platform_id: requested.append(platform_id)
+    plugin = main_mod.NapCatWatchdogPlugin(context, astrbot_api.AstrBotConfig())
+    assert await plugin._notification_target_ready("missing:GroupMessage:456") is False
+    assert requested == ["missing"]
+    assert await plugin._notification_target_ready("bot-a:FriendMessage:456") is False
+    assert requested == ["missing"]

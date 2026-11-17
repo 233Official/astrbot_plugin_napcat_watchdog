@@ -32,7 +32,7 @@ from .subscriptions import SubscriptionRecord, SubscriptionStore
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_ATTEMPTS = 3
 _MAX_DEDUPE_IDS = 512
 _RENDER_OPTIONS = {
@@ -149,7 +149,9 @@ class PendingNotificationStore:
         # remaining compatible with Python 3.10.
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._completed: OrderedDict[str, None] = OrderedDict()
+        self.delivery_targets: dict[str, float] = {}
         self._needs_migration = False
+        self._legacy_backup: tuple[int, bytes] | None = None
 
     @property
     def count(self) -> int:
@@ -198,6 +200,7 @@ class PendingNotificationStore:
         removed = [key for key, item in self._items.items() if item.umo == umo]
         for key in removed:
             del self._items[key]
+        self.delivery_targets.pop(umo, None)
         self._prune_dedupe()
         return len(removed)
 
@@ -205,8 +208,9 @@ class PendingNotificationStore:
         if not self.path.is_file():
             return
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            content = self.path.read_bytes()
+            raw = json.loads(content.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise NotificationPersistenceError(
                 f"Corrupt pending notification file: {type(exc).__name__}"
             ) from exc
@@ -214,7 +218,7 @@ class PendingNotificationStore:
         if not isinstance(raw, dict):
             raise NotificationPersistenceError("Invalid pending notification envelope")
         schema_version = raw.get("_schema_version")
-        if schema_version not in {1, _SCHEMA_VERSION}:
+        if type(schema_version) is not int or schema_version not in {1, 2, 3}:
             raise NotificationPersistenceError(
                 "Unsupported pending notification schema"
             )
@@ -222,53 +226,60 @@ class PendingNotificationStore:
         if not isinstance(pending, dict):
             raise NotificationPersistenceError("Invalid pending notification entries")
 
+        legacy_keys = {"_schema_version", "pending"}
+        dedupe_keys = legacy_keys | {"seen", "completed"}
+        needs_migration = schema_version != _SCHEMA_VERSION
+        targets: dict[str, float] = {}
         if schema_version == 1:
-            if set(raw) != {"_schema_version", "pending"}:
-                raise NotificationPersistenceError(
-                    "Invalid legacy pending notification envelope"
-                )
-            entry_keys = self._ENTRY_KEYS - {"episode_id"}
-            self._needs_migration = True
+            valid_envelope = set(raw) == legacy_keys
             seen: OrderedDict[str, None] = OrderedDict()
             completed: OrderedDict[str, None] = OrderedDict()
+        elif schema_version == 2 and set(raw) == legacy_keys:
+            # The early v2 draft did not yet persist the deduplication arrays.
+            valid_envelope = True
+            seen = OrderedDict()
+            completed = OrderedDict()
         else:
-            if set(raw) == {"_schema_version", "pending"}:
-                # Accept the intermediate v2 draft that added the episode
-                # field before durable seen/completed arrays were introduced.
-                seen = OrderedDict()
-                completed = OrderedDict()
-                self._needs_migration = True
-            elif set(raw) == {
-                "_schema_version",
-                "pending",
-                "seen",
-                "completed",
-            }:
-                seen = _load_event_id_set(raw.get("seen"), "seen")
-                completed = _load_event_id_set(raw.get("completed"), "completed")
-                self._needs_migration = False
-            else:
-                raise NotificationPersistenceError(
-                    "Invalid pending notification envelope"
-                )
-            entry_keys = self._ENTRY_KEYS
+            expected = dedupe_keys
+            if schema_version == _SCHEMA_VERSION:
+                expected = expected | {"delivery_targets"}
+            valid_envelope = set(raw) == expected
+            seen = _load_event_id_set(raw.get("seen"), "seen")
+            completed = _load_event_id_set(raw.get("completed"), "completed")
+        if not valid_envelope:
+            raise NotificationPersistenceError("Invalid pending notification envelope")
+
+        if schema_version == _SCHEMA_VERSION:
+            raw_targets = raw["delivery_targets"]
+            if not isinstance(raw_targets, dict):
+                raise NotificationPersistenceError("Invalid notification target state")
+            for umo, next_allowed in raw_targets.items():
+                if (
+                    not _is_valid_umo(umo)
+                    or isinstance(next_allowed, bool)
+                    or not isinstance(next_allowed, (int, float))
+                    or not _is_finite_nonnegative(next_allowed)
+                ):
+                    raise NotificationPersistenceError(
+                        "Invalid notification target allowance"
+                    )
+                targets[umo] = float(next_allowed)
 
         loaded: dict[str, PendingNotification] = {}
+        legacy_entry_keys = self._ENTRY_KEYS - {"episode_id"}
+        entry_keys = legacy_entry_keys if schema_version == 1 else self._ENTRY_KEYS
         for key, value in pending.items():
             if not isinstance(key, str) or not isinstance(value, dict):
                 raise NotificationPersistenceError(
                     "Invalid pending notification record"
                 )
             value_keys = set(value)
-            legacy_entry_keys = self._ENTRY_KEYS - {"episode_id"}
             if value_keys != entry_keys and not (
                 schema_version == 2 and value_keys == legacy_entry_keys
             ):
                 raise NotificationPersistenceError(
                     "Unexpected pending notification fields"
                 )
-            if value_keys == legacy_entry_keys:
-                self._needs_migration = True
             try:
                 item = PendingNotification.from_dict(value)
                 self._validate_item(item)
@@ -282,10 +293,16 @@ class PendingNotificationStore:
         self._items = loaded
         self._seen = seen
         self._completed = completed
+        self.delivery_targets = targets
         before = (len(self._seen), len(self._completed))
         self._prune_dedupe()
-        if before != (len(self._seen), len(self._completed)):
-            self._needs_migration = True
+        self._needs_migration = needs_migration or before != (
+            len(self._seen),
+            len(self._completed),
+        )
+        self._legacy_backup = (
+            (schema_version, content) if schema_version < _SCHEMA_VERSION else None
+        )
 
     def save(self) -> None:
         self._prune_dedupe()
@@ -294,25 +311,33 @@ class PendingNotificationStore:
             "pending": {key: item.to_dict() for key, item in self._items.items()},
             "seen": list(self._seen),
             "completed": list(self._completed),
+            "delivery_targets": dict(self.delivery_targets),
         }
         tmp_path = self.path.with_name(self.path.name + ".tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._backup_legacy()
             fd = os.open(
                 str(tmp_path),
                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_SYNC,
                 0o600,
             )
-            try:
-                os.write(
-                    fd,
-                    json.dumps(data, indent=2, sort_keys=True).encode("utf-8"),
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(
+                    json.dumps(data, indent=2, sort_keys=True, allow_nan=False).encode(
+                        "utf-8"
+                    )
                 )
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(str(tmp_path), str(self.path))
-        except OSError as exc:
+            # A reservation is not durable until the renamed directory entry is.
+            parent_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except (OSError, ValueError) as exc:
             try:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
@@ -320,6 +345,32 @@ class PendingNotificationStore:
             raise NotificationPersistenceError(
                 f"Failed to persist pending notifications: {type(exc).__name__}"
             ) from exc
+        self._needs_migration = False
+        self._legacy_backup = None
+
+    def _backup_legacy(self) -> None:
+        """Preserve original legacy bytes before the first schema-v3 replacement."""
+        if self._legacy_backup is None:
+            return
+        version, content = self._legacy_backup
+        digest = hashlib.sha256(content).hexdigest()[:16]
+        backup = self.path.with_name(f"{self.path.name}.v{version}.{digest}.bak")
+        try:
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if backup.read_bytes() != content:
+                raise ValueError("Legacy notification backup mismatch")
+            return
+        complete = False
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            complete = True
+        finally:
+            if not complete:
+                backup.unlink(missing_ok=True)
 
     @classmethod
     def _validate_item(cls, item: PendingNotification) -> None:
@@ -340,6 +391,12 @@ class PendingNotificationStore:
             or not isinstance(item.duration_seconds, (int, float))
         ):
             raise ValueError("duration_seconds must be numeric or null")
+        if not _is_finite_nonnegative(item.event_time):
+            raise ValueError("event_time must be finite and non-negative")
+        if item.duration_seconds is not None and not _is_finite_nonnegative(
+            item.duration_seconds
+        ):
+            raise ValueError("duration_seconds must be finite and non-negative")
         if not _is_valid_umo(item.umo) or not isinstance(item.owner_id, str):
             raise ValueError("invalid target context")
         if not item.owner_id:
@@ -387,13 +444,17 @@ class NotificationManager:
         *,
         html_render: Callable[..., Any] | None = None,
         template_path: Path | None = None,
-        retry_delay: float = 0.0,
+        min_send_interval: float = 30.0,
+        failure_cooldown: float = 300.0,
+        max_pending_age: float = 3600.0,
         max_attempts: int = _MAX_ATTEMPTS,
         wall_clock: Callable[[], float] = time.time,
         profile_provider: Callable[[int], Any] | None = None,
         profile_waiter: Callable[[int], Awaitable[Any]] | None = None,
         profile_wait_timeout: float = 3.0,
         instance_label: str | None = None,
+        state_provider: Callable[[int], str | None] | None = None,
+        target_guard: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self.context = context
         self.subscription_store = subscription_store
@@ -402,13 +463,22 @@ class NotificationManager:
         self.template_path = template_path or (
             Path(__file__).resolve().parents[1] / "templates" / "notification_card.html"
         )
-        self.retry_delay = max(0.0, min(float(retry_delay), 2.0))
+        self.min_send_interval = max(0.0, float(min_send_interval))
+        self.failure_cooldown = max(self.min_send_interval, float(failure_cooldown))
+        self.max_pending_age = max(0.0, float(max_pending_age))
         self.max_attempts = max(1, min(int(max_attempts), _MAX_ATTEMPTS))
         self.wall_clock = wall_clock
         self.profile_provider = profile_provider
         self.profile_waiter = profile_waiter
-        self.profile_wait_timeout = max(0.0, float(profile_wait_timeout))
+        self.profile_wait_timeout = max(0.0, min(float(profile_wait_timeout), 3.0))
         self.instance_label = instance_label
+        self.state_provider = state_provider
+        self.target_guard = target_guard
+        self._closed = False
+        self._workers: dict[str, asyncio.Task[None]] = {}
+        self._render_tasks: dict[str, asyncio.Task[Any | None]] = {}
+        self._render_users: dict[str, int] = {}
+        self._owned_renders: set[asyncio.Task[Any | None]] = set()
 
     @property
     def pending_count(self) -> int:
@@ -417,8 +487,7 @@ class NotificationManager:
     def load(self) -> None:
         self.pending.load()
         if self.pending.needs_migration:
-            # Rewrite v1 pending deliveries immediately so a restart during
-            # the next delivery cycle cannot lose the migrated record.
+            # Preserve attempts and deduplication before any delivery is scheduled.
             self.pending.save()
 
     def persist(self) -> None:
@@ -436,11 +505,9 @@ class NotificationManager:
         episode_id: int | None = None,
         offline_episode_id: int | None = None,
     ) -> None:
-        """Handle exactly one committed notification transition.
-
-        Pending/offline signals never call this method in the state machine;
-        the kind check is repeated here as a fail-closed boundary.
-        """
+        """Durably enqueue one transition, awaiting only newly due workers."""
+        if self._closed:
+            return
         event_type = _event_type(kind)
         if event_type is None:
             return
@@ -459,105 +526,298 @@ class NotificationManager:
             duration = _duration_since(event_ts, offline_since)
         if episode_id is None:
             episode_id = offline_episode_id
+        if episode_id is not None and (
+            isinstance(episode_id, bool)
+            or not isinstance(episode_id, int)
+            or episode_id < 0
+        ):
+            return
         base_id = _event_key(self_id, event_type, event_ts, episode_id)
         if self.pending.is_seen(base_id):
             return
-        subscriptions = [
-            record
-            for record in self.subscription_store.all()
-            if _is_valid_umo(record.umo)
-        ]
         self.pending.mark_seen(base_id)
-        self._safe_persist()
-        if not subscriptions:
-            return
-
-        image_result = await self._render_card(
-            self_id=self_id,
-            event_type=event_type,
-            event_time=event_ts,
-            duration_seconds=duration,
-        )
-
-        for record in subscriptions:
-            pending = self._find_for_target(base_id, record.umo)
-            if pending is None:
-                pending = PendingNotification(
-                    event_id=_target_event_key(base_id, record.umo),
-                    self_id=self_id,
-                    event_type=event_type,
-                    event_time=event_ts,
-                    duration_seconds=duration,
-                    umo=record.umo,
-                    owner_id=record.owner_id,
-                    episode_id=episode_id,
+        for record in self.subscription_store.all():
+            if not _is_valid_umo(record.umo):
+                continue
+            target_id = _target_event_key(base_id, record.umo)
+            # A migrated record may predate its durable seen marker. Never
+            # replace it with a fresh attempt budget.
+            if self.pending.get(target_id) is None:
+                self.pending.upsert(
+                    PendingNotification(
+                        event_id=target_id,
+                        self_id=self_id,
+                        event_type=event_type,
+                        event_time=event_ts,
+                        duration_seconds=duration,
+                        umo=record.umo,
+                        owner_id=record.owner_id,
+                        episode_id=episode_id,
+                    )
                 )
-            else:
-                # The current subscription owner controls an offline mention.
-                pending.owner_id = record.owner_id
-            try:
-                await self._deliver(pending, record, image_result)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("NapCat notification target delivery failed")
+        self._normalize(_safe_timestamp(None, self.wall_clock()))
+        if not self._safe_persist():
+            return
+        workers = self.dispatch_pending()
+        if workers:
+            await asyncio.gather(*workers)
 
     async def catch_up(self) -> None:
-        """Resume valid pending entries, dropping removed subscriptions."""
-        for pending in list(self.pending.all()):
-            record = self.subscription_store.get(pending.umo)
-            if record is None or not _is_valid_umo(record.umo):
-                self.pending.remove(pending.event_id)
-                self._safe_persist()
+        """Normalize startup state without rendering, sending, or starting tasks."""
+        if not self._closed and self._normalize(
+            _safe_timestamp(None, self.wall_clock())
+        ):
+            self._safe_persist()
+
+    def dispatch_pending(self) -> tuple[asyncio.Task[None], ...]:
+        """Start at most one due worker per exact UMO, without waiting for it."""
+        if self._closed:
+            return ()
+        now = _safe_timestamp(None, self.wall_clock())
+        if self._normalize(now) and not self._safe_persist():
+            return ()
+        selected: dict[str, PendingNotification] = {}
+        for pending in self.pending.all():
+            if (
+                pending.umo in self._workers
+                or pending.attempts >= self.max_attempts
+                or self.pending.delivery_targets.get(pending.umo, 0.0) > now
+                or self._state_action(pending) != "deliver"
+            ):
                 continue
-            if pending.attempts >= self.max_attempts:
-                # A capped run must remain catch-up eligible after restart;
-                # the cap applies to one delivery session, while the durable
-                # record is precisely what lets a later plugin start resume.
-                pending.attempts = 0
-                self._safe_persist()
-            pending.owner_id = record.owner_id
-            image_result = await self._render_card(
-                self_id=pending.self_id,
-                event_type=pending.event_type,
-                event_time=pending.event_time,
-                duration_seconds=pending.duration_seconds,
+            previous = selected.get(pending.umo)
+            if previous is None or (
+                pending.event_time,
+                pending.event_type == "recovered",
+                pending.event_id,
+            ) > (
+                previous.event_time,
+                previous.event_type == "recovered",
+                previous.event_id,
+            ):
+                selected[pending.umo] = pending
+
+        workers: list[asyncio.Task[None]] = []
+        for umo, pending in selected.items():
+            base_id = pending.event_id.rsplit(":", 1)[0]
+            worker = asyncio.create_task(self._deliver(pending))
+            self._workers[umo] = worker
+            self._render_users[base_id] = self._render_users.get(base_id, 0) + 1
+            worker.add_done_callback(
+                lambda task, target=umo, event=base_id: self._worker_done(
+                    target, event, task
+                )
             )
-            try:
-                await self._deliver(pending, record, image_result)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("NapCat pending target delivery failed")
+            workers.append(worker)
+        return tuple(workers)
+
+    async def close(self) -> None:
+        """Stop all owned work; shielded connection profile refreshes survive."""
+        self._closed = True
+        tasks = (*self._workers.values(), *self._owned_renders)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def drop_for_umo(self, umo: str) -> None:
-        """Discard pending entries for a subscription that was removed."""
-        if self.pending.drop_for_umo(umo):
+        """Discard both queued summaries and pacing for an unsubscribed UMO."""
+        had_target = umo in self.pending.delivery_targets
+        if self.pending.drop_for_umo(umo) or had_target:
             self._safe_persist()
 
-    async def _deliver(
-        self,
-        pending: PendingNotification,
-        record: SubscriptionRecord,
-        image_result: Any,
-    ) -> None:
-        if not _is_valid_umo(record.umo):
-            return
-        if self.pending.is_completed(pending.event_id):
+    @staticmethod
+    def _is_newer(
+        candidate: PendingNotification, previous: PendingNotification
+    ) -> bool:
+        if (
+            candidate.episode_id is not None
+            and previous.episode_id is not None
+            and candidate.episode_id != previous.episode_id
+        ):
+            return candidate.episode_id > previous.episode_id
+        return (
+            candidate.event_time,
+            candidate.event_type == "recovered",
+            candidate.event_id,
+        ) > (
+            previous.event_time,
+            previous.event_type == "recovered",
+            previous.event_id,
+        )
+
+    def _normalize(self, now: float) -> bool:
+        changed = False
+        newest: dict[tuple[int, str], PendingNotification] = {}
+        pending_items = self.pending.all()
+        # Coalesce before filtering: discarding a newer obsolete/expired event
+        # must never expose an older summary from the same account and target.
+        for pending in pending_items:
+            base_id = pending.event_id.rsplit(":", 1)[0]
+            if not self.pending.is_seen(base_id):
+                self.pending.mark_seen(base_id)
+                changed = True
+            key = (pending.self_id, pending.umo)
+            previous = newest.get(key)
+            if previous is None or self._is_newer(pending, previous):
+                newest[key] = pending
+        for pending in pending_items:
+            record = self.subscription_store.get(pending.umo)
+            if (
+                newest[(pending.self_id, pending.umo)] is not pending
+                or record is None
+                or not _is_valid_umo(record.umo)
+                or now - pending.event_time > self.max_pending_age
+                or self.pending.is_completed(pending.event_id)
+                or self._state_action(pending) == "drop"
+            ):
+                self.pending.remove(pending.event_id)
+                changed = True
+            elif pending.owner_id != record.owner_id:
+                pending.owner_id = record.owner_id
+                changed = True
+        for umo, next_allowed in list(self.pending.delivery_targets.items()):
+            record = self.subscription_store.get(umo)
+            if record is None or not _is_valid_umo(record.umo) or next_allowed <= now:
+                del self.pending.delivery_targets[umo]
+                changed = True
+        return changed
+
+    def _state_action(self, pending: PendingNotification) -> str:
+        if self.state_provider is None:
+            return "deliver"
+        try:
+            status = self.state_provider(pending.self_id)
+        except Exception:
+            logger.debug("NapCat notification state lookup failed", exc_info=True)
+            return "defer"
+        if status is None:
+            return "drop"
+        if status not in {"online", "offline"}:
+            return "defer"
+        expected = "online" if pending.event_type == "recovered" else "offline"
+        return "deliver" if status == expected else "drop"
+
+    def _ready_record(
+        self, pending: PendingNotification, now: float
+    ) -> SubscriptionRecord | None:
+        if self._closed or self.pending.get(pending.event_id) is not pending:
+            return None
+        record = self.subscription_store.get(pending.umo)
+        state_action = self._state_action(pending)
+        if (
+            record is None
+            or not _is_valid_umo(record.umo)
+            or now - pending.event_time > self.max_pending_age
+            or self.pending.is_completed(pending.event_id)
+            or state_action == "drop"
+        ):
             self.pending.remove(pending.event_id)
             self._safe_persist()
-            return
-        self.pending.upsert(pending)
-        self._safe_persist()
+            return None
+        if (
+            state_action != "deliver"
+            or pending.attempts >= self.max_attempts
+            or self.pending.delivery_targets.get(pending.umo, 0.0) > now
+        ):
+            return None
+        return record
 
-        while pending.attempts < self.max_attempts:
+    async def _target_allowed(self, umo: str) -> bool:
+        if self.target_guard is None:
+            return True
+        try:
+            allowed = bool(await self.target_guard(umo))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "NapCat notification target policy check failed", exc_info=True
+            )
+            allowed = False
+        if not allowed and not self._closed:
+            record = self.subscription_store.get(umo)
+            if record is not None and _is_valid_umo(record.umo):
+                now = _safe_timestamp(None, self.wall_clock())
+                self.pending.delivery_targets[umo] = max(
+                    self.pending.delivery_targets.get(umo, 0.0),
+                    now + self.failure_cooldown,
+                )
+                self._safe_persist()
+        return allowed
+
+    async def _shared_render(self, pending: PendingNotification) -> Any | None:
+        base_id = pending.event_id.rsplit(":", 1)[0]
+        task = self._render_tasks.get(base_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._render_card(
+                    self_id=pending.self_id,
+                    event_type=pending.event_type,
+                    event_time=pending.event_time,
+                    duration_seconds=pending.duration_seconds,
+                )
+            )
+            self._render_tasks[base_id] = task
+            self._owned_renders.add(task)
+            task.add_done_callback(self._render_done)
+        return await asyncio.shield(task)
+
+    def _render_done(self, task: asyncio.Task[Any | None]) -> None:
+        self._owned_renders.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    def _worker_done(self, umo: str, base_id: str, task: asyncio.Task[None]) -> None:
+        if self._workers.get(umo) is task:
+            del self._workers[umo]
+        remaining = self._render_users[base_id] - 1
+        if remaining:
+            self._render_users[base_id] = remaining
+        else:
+            del self._render_users[base_id]
+            render = self._render_tasks.pop(base_id, None)
+            if render is not None and not render.done():
+                render.cancel()
+        if not task.cancelled():
+            task.exception()
+
+    async def _deliver(self, pending: PendingNotification) -> None:
+        try:
+            if (
+                self._ready_record(pending, _safe_timestamp(None, self.wall_clock()))
+                is None
+            ):
+                return
+            if not await self._target_allowed(pending.umo):
+                return
+            if (
+                self._ready_record(pending, _safe_timestamp(None, self.wall_clock()))
+                is None
+            ):
+                return
+            image_result = await self._shared_render(pending)
+            if (
+                self._ready_record(pending, _safe_timestamp(None, self.wall_clock()))
+                is None
+            ):
+                return
+            if not await self._target_allowed(pending.umo):
+                return
+            now = _safe_timestamp(None, self.wall_clock())
+            record = self._ready_record(pending, now)
+            if record is None:
+                return
+            pending.owner_id = record.owner_id
             pending.attempts += 1
+            self.pending.delivery_targets[pending.umo] = now + self.failure_cooldown
+            # No send is permitted unless its spent attempt and conservative
+            # unknown-outcome cooldown have reached durable storage first.
+            if not self._safe_persist():
+                return
             try:
                 sent = await self._send_once(
-                    record.umo,
-                    pending,
-                    image_result,
-                    record.owner_id,
+                    record.umo, pending, image_result, record.owner_id
                 )
             except asyncio.CancelledError:
                 raise
@@ -565,22 +825,22 @@ class NotificationManager:
                 logger.exception("NapCat notification delivery callback failed")
                 sent = False
 
+            now = _safe_timestamp(None, self.wall_clock())
+            record = self.subscription_store.get(pending.umo)
+            if record is not None and _is_valid_umo(record.umo):
+                delay = self.min_send_interval if sent else self.failure_cooldown
+                self.pending.delivery_targets[pending.umo] = now + delay
             if sent:
-                self.pending.remove(pending.event_id)
+                # A newer event may have superseded this one during the send.
+                if self.pending.get(pending.event_id) is pending:
+                    self.pending.remove(pending.event_id)
                 self.pending.mark_completed(pending.event_id)
-                self._safe_persist()
-                return
-
-            self.pending.upsert(pending)
             self._safe_persist()
-            if pending.attempts < self.max_attempts and self.retry_delay:
-                await asyncio.sleep(self.retry_delay)
-
-        logger.error(
-            "NapCat notification delivery exhausted retries event_type=%s attempts=%s",
-            pending.event_type,
-            pending.attempts,
-        )
+        except asyncio.CancelledError:
+            # An unknown send outcome keeps the pre-send reservation intact.
+            raise
+        except Exception:
+            logger.exception("NapCat notification target delivery failed")
 
     async def _send_once(
         self,
@@ -651,10 +911,6 @@ class NotificationManager:
             diagnostic_label="NapCat notification card rendering",
         )
 
-    def _find_for_target(self, base_id: str, umo: str) -> PendingNotification | None:
-        target_id = _target_event_key(base_id, umo)
-        return self.pending.get(target_id)
-
     def _profile_values(self, self_id: int) -> tuple[str | None, str | None]:
         provider = self.profile_provider
         if not callable(provider):
@@ -673,11 +929,13 @@ class NotificationManager:
             avatar = getattr(profile, "avatar_data_uri", None)
         return sanitize_nickname(nickname), _safe_avatar_data_uri(avatar)
 
-    def _safe_persist(self) -> None:
+    def _safe_persist(self) -> bool:
         try:
             self.pending.save()
         except NotificationPersistenceError:
             logger.exception("NapCat pending notification persistence failed")
+            return False
+        return True
 
 
 # Compatibility alias for callers using service terminology.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -224,6 +225,8 @@ class NapCatWatchdogPlugin(Star):
             profile_provider=self._get_profile,
             profile_waiter=self._wait_for_profile,
             instance_label=str(self.config.get("instance_label", "") or ""),
+            state_provider=self._notification_status,
+            target_guard=self._notification_target_ready,
         )
         try:
             self._notification_manager.load()
@@ -245,6 +248,9 @@ class NapCatWatchdogPlugin(Star):
 
         if loaded_snapshot is not None:
             self._sm.load_snapshot(loaded_snapshot)
+
+        # Startup only normalizes durable summaries; it never replays messages.
+        await self._notification_manager.catch_up()
 
         # ---- 6. WS server ----
         host: str = self.config.get("listen_host", "0.0.0.0") or "0.0.0.0"
@@ -285,15 +291,6 @@ class NapCatWatchdogPlugin(Star):
         # ---- 9. Start grace timers ----
         self._sm.start_grace_timers()
 
-        # Catch-up is deliberately after subscriptions are loaded and before
-        # accepting new WS traffic.  Removed targets are dropped here.
-        try:
-            await self._notification_manager.catch_up()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Pending notification catch-up failed")
-
     async def terminate(self) -> None:
         """停止所有组件。
 
@@ -313,6 +310,7 @@ class NapCatWatchdogPlugin(Star):
         self._notification_tasks.clear()
 
         if self._notification_manager is not None:
+            await self._notification_manager.close()
             try:
                 self._notification_manager.persist()
             except NotificationPersistenceError:
@@ -414,6 +412,80 @@ class NapCatWatchdogPlugin(Star):
         if self._profile_cache is None:
             return None
         return self._profile_cache.get(self_id)
+
+    def _notification_status(self, self_id: int) -> str | None:
+        """Use current monitor state to reject stale queued notifications."""
+        if self._sm is None:
+            return None
+        view = self._sm.get_view(self_id)
+        return view["status"] if view is not None else None
+
+    async def _notification_target_ready(self, umo: str) -> bool:
+        """Read current sender membership and mute state; never probe by sending."""
+        parts = umo.split(":")
+        if len(parts) != 3 or parts[1] != "GroupMessage":
+            return False
+        group_id = parts[2].rsplit("_", 1)[-1]
+        if not group_id.isdigit() or int(group_id) <= 0:
+            return False
+
+        async def check() -> bool:
+            platform = self.context.get_platform_inst(parts[0])
+            if platform is None or platform.meta().name != "aiocqhttp":
+                return False
+            client = platform.get_client()
+            login = await client.api.call_action("get_login_info")
+            if not isinstance(login, dict):
+                return False
+            self_id = login.get("user_id")
+            if (
+                isinstance(self_id, bool)
+                or not isinstance(self_id, (int, str))
+                or not str(self_id).isdigit()
+                or int(self_id) <= 0
+            ):
+                return False
+            member = await client.api.call_action(
+                "get_group_member_info",
+                group_id=int(group_id),
+                user_id=int(self_id),
+                no_cache=True,
+            )
+            if (
+                not isinstance(member, dict)
+                or str(member.get("user_id")) != str(self_id)
+                or str(member.get("group_id")) != group_id
+            ):
+                return False
+            muted_until = member.get("shut_up_timestamp")
+            if (
+                isinstance(muted_until, bool)
+                or not isinstance(muted_until, (int, float))
+                or not math.isfinite(muted_until)
+                or muted_until < 0
+                or muted_until > time.time()
+            ):
+                return False
+            role = member.get("role")
+            if role in {"owner", "admin"}:
+                return True
+            if role != "member":
+                return False
+            group = await client.api.call_action(
+                "get_group_info", group_id=int(group_id), no_cache=True
+            )
+            if not isinstance(group, dict) or str(group.get("group_id")) != group_id:
+                return False
+            all_muted = group.get("group_all_shut")
+            return isinstance(all_muted, (bool, int)) and all_muted in (False, 0)
+
+        try:
+            return await asyncio.wait_for(check(), timeout=3.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("OneBot notification target preflight unavailable")
+            return False
 
     async def _wait_for_profile(self, self_id: int) -> None:
         """Wait for existing enrichment without starting network work."""
@@ -525,6 +597,8 @@ class NapCatWatchdogPlugin(Star):
                                 QQStatus.OFFLINE,
                                 kind,
                             )
+                if self._notification_manager is not None:
+                    self._notification_manager.dispatch_pending()
             except asyncio.CancelledError:
                 break
             except Exception:
